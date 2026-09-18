@@ -17,53 +17,81 @@ use crate::vboot::image::type_name;
 use crate::vboot::ops;
 
 const HELP: &str = "bootsmasher unpack — extract boot/vendor_boot images (magiskboot superset)
+Aliases: u, up.
 
 Usage:
-  bootsmasher unpack <image> [-h] [-n] [--out-dir <dir>] [--extract] [--no-spec]
+  bootsmasher unpack <image> [-h] [-n] [-o <dir>] [-x] [--no-spec]
   bootsmasher unpack --help
 
 What it does:
-  Detects ANDROID! (boot v0..v4) vs VNDRBOOT (vendor_boot v3/v4) and dumps
-  every section as files with magiskboot-compatible names:
+  Detects ANDROID! (boot v0..v4) vs VNDRBOOT (vendor_boot v3/v4) by magic
+  and dumps every section as files with magiskboot-compatible names:
     kernel | kernel_dtb | ramdisk.cpio | second | extra | recovery_dtbo |
     dtb | signature | bootconfig | header (-h) | footer.bin | spec.toml
   vendor_boot ramdisk fragments go to vendor_ramdisk/<name>.cpio
-  (platform fragment = ramdisk.cpio), exactly like magiskboot.
+  (the platform fragment is vendor_ramdisk/ramdisk.cpio), exactly like
+  magiskboot. Sections are read sequentially, each padded to the page
+  size (v0..v2/vendor page, fixed 4096 for boot v3/v4).
 
 Options:
   -h               Write the magiskboot-compatible 'header' file
-                   (name/cmdline/os_version/os_patch_level). Always
-                   additionally writes our full-fidelity spec.toml
-                   (disable with --no-spec).
-  -n               Keep components compressed in their original format.
-                   Default: kernel/ramdisk/extra are decompressed on the fly;
-                   a fragment that fails to decompress is still dumped RAW
-                   (nothing is lost) and flagged INVALID in the report.
-  --out-dir <dir>  Destination directory (created). Default: current dir,
-                   like magiskboot (files are overwritten, like magiskboot).
-  --extract        Expand every usable cpio into <file>.d/ next to it
+                   (name, cmdline, os_version, os_patch_level — the only
+                   header keys magiskboot round-trips). NOTE: unlike
+                   magiskboot, -h here never means --help; use --help.
+                   Our lean spec.toml is always written too (only what
+                   repack reads: scalars, per-file formats/sizes,
+                   names/types/board_id; verdicts stay in the report).
+  -n               Keep components compressed in their original stored
+                   format (no decompression). Default: kernel, ramdisk
+                   and extra are decompressed on the fly; a fragment that
+                   fails to decompress is still dumped RAW (nothing is
+                   lost) and flagged INVALID in the report.
+  -o <dir>, --out-dir <dir>
+                   Destination directory (created if missing).
+                   Default: current directory, like magiskboot (existing
+                   files are overwritten, like magiskboot).
+  -x, --extract    Expand every usable cpio into <file>.d/ next to it
                    (ramdisk.cpio -> ramdisk.d/, dlkm.cpio -> dlkm.d/):
-                   files, dirs, symlinks + unix permission bits. One-way
-                   inspection aid; repack works from the .cpio files.
-                   With -n the on-disk files stay raw, extraction still runs.
-  --no-spec        Skip spec.toml (magiskboot-parity mode).
+                   files, dirs, symlinks + unix permission bits restored.
+                   One-way inspection aid; repack works from the .cpio
+                   files, not from the .d/ trees. With -n the on-disk
+                   files stay raw, extraction still runs from memory
+                   whenever the bytes are decodable.
+  --no-spec        Skip spec.toml (magiskboot-parity mode: only the
+                   classic files are written).
+
+Detected formats (sniffed by magic, same order as magiskboot):
+  raw | gzip (1f 8b) | xz (fd 37 7a 58 5a 00) | lzma-alone (5d + pow2
+  dict) | lz4-frame (03/04 21/22 4c/4d 18) | lz4-legacy (02 21 4c 18).
+  Pixel kernels/ramdisks are usually lz4-legacy; GKI kernels ship as
+  lz4-legacy Image.lz4 blobs.
 
 Reporting (stdout; diagnostics and errors go to stderr):
-  Every section prints size, detected format and a verdict. Broken parts
-  do NOT abort the run: the WHY names the exact cause, e.g.
+  Every section prints: byte range, declared vs available size, detected
+  format and a verdict. Broken parts do NOT abort the run: the WHY names
+  the exact cause, e.g.
     frag 0 platform: INVALID lz4 block 6 truncated (need 3970208, have
       1175831) — table slices one stream mid-block; table sum 30028782
       vs header 30034170 (diff 5388)
-    kernel: truncated, header says 12345, file has 10000 (cut download?)
+    kernel: TRUNCATED, header says 12345, file has 10000 (cut download?)
+    dtb: INVALID FDT 1 totalsize runs past dtb end (overlay typo?)
   A stale-table vendor_boot additionally yields
-  vendor_ramdisk/ramdisk.full-rescue.cpio (the whole blob as one valid
-  stream) so the content is still recoverable.
+  vendor_ramdisk/ramdisk.full-rescue.cpio (the whole blob decoded as one
+  valid stream, with its file count) so the content is still recoverable.
+  vendor_boot with dtb_size 0 is legal (dtb absent, not broken).
   Final line is RESULT: OK (exit 0) or RESULT: DEGRADED (exit 0 too —
   grep for INVALID in scripts; exit 2 only when even the header is
   unreadable and nothing can be dumped).
 
-Exit codes: 0 unpacked (possibly degraded, see report), 1 usage error,
-  2 unreadable image.";
+Typical sessions:
+  bootsmasher unpack vendor_boot.img -o dir -h -x
+  bootsmasher u boot.img -o dir -n          # raw, magiskboot-style
+  bootsmasher unpack broken.img -o dir      # degraded + rescue file
+  NOTE: unpack always writes files, never stdout (use the vboot
+  subprogram for pipe mode).
+
+Exit codes: 0 unpacked (possibly DEGRADED, see report), 1 usage error,
+  2 unreadable image (bad magic / truncated header).";
 
 pub fn run(args: &[String]) -> i32 {
     match run_inner(args) {
@@ -106,12 +134,12 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
             "--help" => return Err(Error::Usage("help requested".to_string())),
             "-h" => header = true,
             "-n" => raw = true,
-            "--extract" => extract = true,
+            "-x" | "--extract" => extract = true,
             "--no-spec" => spec = false,
-            "--out-dir" => {
+            "-o" | "--out-dir" => {
                 i += 1;
                 out_dir = PathBuf::from(
-                    args.get(i).ok_or_else(|| Error::Usage("--out-dir needs a value".to_string()))?,
+                    args.get(i).ok_or_else(|| Error::Usage("-o/--out-dir needs a value".to_string()))?,
                 );
             }
             s if s.starts_with('-') => return Err(Error::Usage(format!("unknown flag {s}"))),
@@ -212,13 +240,13 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
         // Slice bytes available for this fragment.
         let slice = frag_slice(bytes, &hdr, f.declared_offset as usize, f.available);
         // On-disk bytes: decompressed when possible (default), else raw.
-        let (disk_bytes, on_disk, entries) = if !cli.raw {
+        let (disk_bytes, on_disk) = if !cli.raw {
             match try_decompress_cpio(slice, &f.stored_format) {
-                Some((dec, n)) => (dec, "decompressed", Some(n)),
-                None => (slice.to_vec(), "raw", None),
+                Some((dec, _)) => (dec, "decompressed"),
+                None => (slice.to_vec(), "raw"),
             }
         } else {
-            (slice.to_vec(), "raw", None)
+            (slice.to_vec(), "raw")
         };
         if !disk_bytes.is_empty() || f.declared_size > 0 {
             write_file(&vdir, &fname, &disk_bytes)?;
@@ -237,42 +265,31 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
             file: format!("vendor_ramdisk/{fname}"),
             name: f.name.clone(),
             etype: type_name(f.etype).to_string(),
-            stored_format: if f.stored_format.is_empty() { "raw".to_string() } else { f.stored_format.clone() },
+            // "unknown" sniff verdict is not a format; on disk these are
+            // verbatim bytes.
+            stored_format: match f.stored_format.as_str() {
+                "" | "unknown" => "raw".to_string(),
+                s => s.to_string(),
+            },
             on_disk: on_disk.to_string(),
             declared_size: f.declared_size,
-            declared_offset: f.declared_offset,
-            valid: f.valid,
-            entries: if on_disk == "decompressed" { entries } else { None },
-            why_invalid: if f.valid { None } else { Some(f.why.clone()) },
             board_id_hex: frag_board_id(bytes, &hdr, f.index),
         });
     }
 
-    // Whole-blob rescue for the stale-table case.
-    let mut rescue = None;
+    // Whole-blob rescue for the stale-table case (file on disk + report
+    // line; repack works from the per-fragment files, so no spec record).
     if d.whole_blob_single_stream && !d.overall_ok {
         let blob = whole_blob(bytes, &hdr);
         if let Some((dec, n)) = try_decompress_cpio(blob, "lz4-legacy") {
-            if cli.raw {
+            let rfile = if cli.raw {
                 write_file(&vdir, "ramdisk.full-rescue.bin", blob)?;
-                rescue = Some(spec::RescueSpec {
-                    file: "vendor_ramdisk/ramdisk.full-rescue.bin".to_string(),
-                    stored_format: codec::sniff(blob).name().to_string(),
-                    entries: n,
-                });
+                "vendor_ramdisk/ramdisk.full-rescue.bin"
             } else {
                 write_file(&vdir, "ramdisk.full-rescue.cpio", &dec)?;
-                rescue = Some(spec::RescueSpec {
-                    file: "vendor_ramdisk/ramdisk.full-rescue.cpio".to_string(),
-                    stored_format: codec::sniff(blob).name().to_string(),
-                    entries: n,
-                });
-            }
-            say(&format!(
-                "rescue: whole blob is one valid stream -> {} ({} files)",
-                rescue.as_ref().unwrap().file,
-                n
-            ));
+                "vendor_ramdisk/ramdisk.full-rescue.cpio"
+            };
+            say(&format!("rescue: whole blob is one valid stream -> {rfile} ({n} files)"));
         }
     }
 
@@ -292,7 +309,7 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
         d.dtb_why,
         if d.dtb_fdts > 0 { format!(" ({} FDTs)", d.dtb_fdts) } else { String::new() }
     ));
-    if d.dtb_why != "ok" {
+    if d.dtb_why != "ok" && !d.dtb_why.starts_with("absent") {
         degraded = true;
     }
     if !dtb_avail.is_empty() {
@@ -320,18 +337,18 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
         write_file(dir, "bootconfig", bc_avail)?;
     }
 
-    // Footer: bytes after the computed image end.
+    // Footer: bytes after the computed image end (file + report only).
     let img_end = crate::vboot::image::align_up(bc_off + hdr.bootconfig_size as usize, page);
-    let footer = write_footer(dir, bytes, img_end)?;
+    write_footer(dir, bytes, img_end)?;
 
     if cli.header {
         let mut h = String::new();
-        h.push_str(&format!("name={}\n", String::from_utf8_lossy(&hdr.name)));
+        h.push_str(&format!("name={}\n", hdr.name_str()));
         h.push_str(&format!("cmdline={}\n", hdr.cmdline_str()));
         write_file(dir, "header", h.as_bytes())?;
     }
     if cli.spec {
-        write_vendor_spec(dir, &cli.image, &hdr, &d, spec_ramdisks, rescue, footer)?;
+        write_vendor_spec(&hdr, &d, spec_ramdisks, dir)?;
     }
     Ok(degraded)
 }
@@ -376,7 +393,7 @@ fn whole_blob<'a>(bytes: &'a [u8], hdr: &crate::vboot::image::Header) -> &'a [u8
 /// returning (cpio_bytes, non_trailer_file_count).
 fn try_decompress_cpio(slice: &[u8], stored_format: &str) -> Option<(Vec<u8>, usize)> {
     let fmt = match stored_format {
-        "lz4-legacy" => Format::Lz4Legacy,
+        "lz4_legacy" | "lz4-legacy" => Format::Lz4Legacy,
         "lz4" => Format::Lz4Frame,
         "gzip" => Format::Gzip,
         "xz" => Format::Xz,
@@ -424,7 +441,7 @@ fn extract_report(vdir: &Path, fname: &str, cpio_bytes: &[u8]) -> Result<()> {
     }
 }
 
-fn write_footer(dir: &Path, bytes: &[u8], img_end: usize) -> Result<spec::FooterSpec> {
+fn write_footer(dir: &Path, bytes: &[u8], img_end: usize) -> Result<()> {
     let start = img_end.min(bytes.len());
     let tail = &bytes[start..];
     let nonzero = tail.iter().filter(|&&b| b != 0).count();
@@ -434,7 +451,7 @@ fn write_footer(dir: &Path, bytes: &[u8], img_end: usize) -> Result<spec::Footer
             tail.len(),
             bytes.len()
         ));
-        return Ok(spec::FooterSpec { size: 0, file: None, all_zero: true });
+        return Ok(());
     }
     // Stored verbatim (magiskboot parity): padded partition dumps carry
     // their padding here; use --drop-footer + --pad-to on repack for lean.
@@ -456,19 +473,15 @@ fn write_footer(dir: &Path, bytes: &[u8], img_end: usize) -> Result<spec::Footer
         }
     }
     say(&note);
-    Ok(spec::FooterSpec { size: tail.len(), file: Some("footer.bin".to_string()), all_zero: false })
+    Ok(())
 }
 
 fn write_vendor_spec(
-    dir: &Path,
-    image: &str,
     hdr: &crate::vboot::image::Header,
     d: &ops::Diagnosis,
     ramdisks: Vec<spec::RamdiskSpec>,
-    rescue: Option<spec::RescueSpec>,
-    footer: spec::FooterSpec,
+    dir: &Path,
 ) -> Result<()> {
-    let file_name = Path::new(image).file_name().map(|s| s.to_string_lossy().into_owned());
     spec::write_spec(
         dir,
         &spec::Spec {
@@ -476,20 +489,17 @@ fn write_vendor_spec(
                 kind: "vendor_boot".to_string(),
                 header_version: hdr.header_version,
                 page_size: hdr.page_size,
-                source: file_name,
                 kernel_addr: Some(hdr.kernel_addr),
                 ramdisk_addr: Some(hdr.ramdisk_addr),
                 second_addr: None,
                 tags_addr: Some(hdr.tags_addr),
                 os_version: None,
-                name: Some(String::from_utf8_lossy(&hdr.name).into_owned()),
+                os_patch_level: None,
+                name: Some(hdr.name_str()),
                 cmdline: Some(hdr.cmdline_str()),
                 extra_cmdline: None,
                 dtb_addr: Some(hdr.dtb_addr),
                 header_size: Some(hdr.header_size),
-                table_size: Some(hdr.table_size),
-                table_entry_num: Some(hdr.table_entry_num),
-                table_entry_size: Some(hdr.table_entry_size),
                 bootconfig_size: Some(hdr.bootconfig_size),
             },
             ramdisk: ramdisks,
@@ -500,8 +510,6 @@ fn write_vendor_spec(
                     stored_format: "raw".to_string(),
                     on_disk: "raw".to_string(),
                     declared_size: d.dtb_declared,
-                    available_size: d.dtb_available as u32,
-                    note: Some(d.dtb_why.clone()),
                 },
                 spec::BlobSpec {
                     name: "bootconfig".to_string(),
@@ -509,12 +517,8 @@ fn write_vendor_spec(
                     stored_format: "raw".to_string(),
                     on_disk: "raw".to_string(),
                     declared_size: d.bootconfig_declared,
-                    available_size: d.bootconfig_available as u32,
-                    note: None,
                 },
             ],
-            rescue,
-            footer: Some(footer),
         },
     )
 }
@@ -568,13 +572,25 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                     write_file(dir, "kernel_dtb", &kern_dtb)?;
                     say(&format!("  kernel_dtb: {} bytes (FDT found inside kernel) [ok]", kern_dtb.len()));
                 }
-                blobs.push(mkblob("kernel", "kernel", fmt, on_disk, declared as u32, s.len as u32, 
-                    if kern.len() != s.len { Some(format!("kernel_dtb split off {} bytes", kern_dtb.len())) } else { None }));
+                blobs.push(mkblob("kernel", "kernel", fmt, on_disk, declared as u32));
                 if !kern_dtb.is_empty() {
-                    blobs.push(mkblob("kernel_dtb", "kernel_dtb", Format::Raw, "raw", kern_dtb.len() as u32, kern_dtb.len() as u32, None));
+                    blobs.push(mkblob("kernel_dtb", "kernel_dtb", Format::Raw, "raw", kern_dtb.len() as u32));
                 }
             }
             "ramdisk" => {
+                if data.is_empty() && declared == 0 {
+                    say("ramdisk: absent (size 0, GKI-style image) [ok]");
+                    ramdisks.push(spec::RamdiskSpec {
+                        file: "ramdisk.cpio".to_string(),
+                        name: String::new(),
+                        etype: "platform".to_string(),
+                        stored_format: "raw".to_string(),
+                        on_disk: "raw".to_string(),
+                        declared_size: 0,
+                        board_id_hex: None,
+                    });
+                    continue;
+                }
                 let fmt = codec::sniff(data);
                 match try_ramdisk_cpio(data, fmt) {
                     Some((dec, n)) => {
@@ -601,10 +617,6 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                             stored_format: fmt.name().to_string(),
                             on_disk: on_disk.to_string(),
                             declared_size: declared as u32,
-                            declared_offset: 0,
-                            valid: true,
-                            entries: if on_disk == "decompressed" { Some(n) } else { None },
-                            why_invalid: None,
                             board_id_hex: None,
                         });
                     }
@@ -635,10 +647,6 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                             stored_format: fmt.name().to_string(),
                             on_disk: "raw".to_string(),
                             declared_size: declared as u32,
-                            declared_offset: 0,
-                            valid: false,
-                            entries: None,
-                            why_invalid: Some(why),
                             board_id_hex: None,
                         });
                     }
@@ -660,7 +668,7 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                 if !data.is_empty() {
                     write_file(dir, "dtb", data)?;
                 }
-                blobs.push(mkblob("dtb", "dtb", Format::Raw, "raw", declared as u32, s.len as u32, Some(note)));
+                blobs.push(mkblob("dtb", "dtb", Format::Raw, "raw", declared as u32));
             }
             _ => {
                 // second | extra | recovery_dtbo | signature: raw, except
@@ -682,17 +690,16 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                 if !disk.is_empty() {
                     write_file(dir, s.file, &disk)?;
                 }
-                blobs.push(mkblob(s.name, s.file, fmt, on_disk, declared as u32, s.len as u32, Some(note)));
+                blobs.push(mkblob(s.name, s.file, fmt, on_disk, declared as u32));
             }
         }
     }
 
-    let footer = write_footer(dir, bytes, img.footer_off)?;
+    write_footer(dir, bytes, img.footer_off)?;
     if cli.header {
         write_boot_header(dir, h)?;
     }
     if cli.spec {
-        let file_name = Path::new(&cli.image).file_name().map(|s| s.to_string_lossy().into_owned());
         spec::write_spec(
             dir,
             &spec::Spec {
@@ -700,30 +707,31 @@ fn unpack_boot(cli: &Cli, bytes: &[u8]) -> Result<bool> {
                     kind: "boot".to_string(),
                     header_version: h.version,
                     page_size: h.page_size,
-                    source: file_name,
                     kernel_addr: (h.version < 3).then_some(h.kernel_addr),
                     ramdisk_addr: (h.version < 3).then_some(h.ramdisk_addr),
                     second_addr: (h.version < 3).then_some(h.second_addr),
                     tags_addr: (h.version < 3).then_some(h.tags_addr),
-                    os_version: Some(h.os_version),
-                    name: Some(String::from_utf8_lossy(&h.name).into_owned()),
+                    os_version: spec::os_human(h.os_version).map(|(v, _)| v),
+                    os_patch_level: spec::os_human(h.os_version).map(|(_, p)| p),
+                    name: Some(trim_nul(&h.name).into_owned()),
                     cmdline: Some(h.cmdline_full()),
                     extra_cmdline: None,
                     dtb_addr: (h.version == 2).then_some(h.dtb_addr),
                     header_size: (h.version >= 1).then_some(h.header_size),
-                    table_size: None,
-                    table_entry_num: None,
-                    table_entry_size: None,
                     bootconfig_size: None,
                 },
                 ramdisk: ramdisks,
                 blob: blobs,
-                rescue: None,
-                footer: Some(footer),
             },
         )?;
     }
     Ok(degraded)
+}
+
+/// NUL-trimmed lossy view of a fixed-size header string field.
+fn trim_nul(b: &[u8]) -> std::borrow::Cow<'_, str> {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end])
 }
 
 fn declared_len(img: &bootimg::BootImage, name: &str) -> usize {
@@ -740,23 +748,13 @@ fn declared_len(img: &bootimg::BootImage, name: &str) -> usize {
     }
 }
 
-fn mkblob(
-    name: &str,
-    file: &str,
-    fmt: Format,
-    on_disk: &str,
-    declared: u32,
-    avail: u32,
-    note: Option<String>,
-) -> spec::BlobSpec {
+fn mkblob(name: &str, file: &str, fmt: Format, on_disk: &str, declared: u32) -> spec::BlobSpec {
     spec::BlobSpec {
         name: name.to_string(),
         file: file.to_string(),
         stored_format: fmt.name().to_string(),
         on_disk: on_disk.to_string(),
         declared_size: declared,
-        available_size: avail,
-        note,
     }
 }
 

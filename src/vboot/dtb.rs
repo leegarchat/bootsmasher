@@ -16,6 +16,16 @@ fn u32be(b: &[u8]) -> u32 {
 /// Walk concatenated FDTs. Returns the count; errors on bad magic,
 /// insane totalsize, or trailing garbage.
 pub fn verify(dtb: &[u8], expected: usize) -> Result<usize> {
+    // dtb_size 0 is legal: the image simply carries no DTB.
+    if expected == 0 {
+        if !dtb.is_empty() {
+            return Err(Error::Verify(format!(
+                "dtb has {} bytes but header dtb_size is 0",
+                dtb.len()
+            )));
+        }
+        return Ok(0);
+    }
     if dtb.len() != expected {
         return Err(Error::Verify(format!(
             "dtb length {} != header dtb_size {expected}",

@@ -1,6 +1,10 @@
-//! `spec.toml`: full-fidelity layout record written by `unpack`,
-//! trusted by `repack`. Human-editable; unknown keys are ignored on read
-//! (forward tolerance), missing files fall back to `--base` bytes.
+//! `spec.toml`: layout record written by `unpack`, trusted by `repack`.
+//!
+//! Only what `repack` actually reads is stored: header scalars, per-file
+//! formats/sizes/names/types/board_id. Everything else (validity verdicts,
+//! entry counts, WHY strings, footer bytes) lives in the unpack stdout
+//! report or on disk as files. Human-editable; unknown keys are ignored
+//! on read (forward tolerance), missing files fall back to `--base` bytes.
 
 use std::path::Path;
 
@@ -15,10 +19,6 @@ pub struct Spec {
     pub ramdisk: Vec<RamdiskSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blob: Vec<BlobSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rescue: Option<RescueSpec>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub footer: Option<FooterSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,8 +27,6 @@ pub struct ImageSpec {
     pub kind: String,
     pub header_version: u32,
     pub page_size: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
     /// All scalar header fields, kind-dependent; absent = 0/empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_addr: Option<u32>,
@@ -38,8 +36,12 @@ pub struct ImageSpec {
     pub second_addr: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags_addr: Option<u32>,
+    /// Human form "A.B.C" (boot only). Decoded back to the bitfield on read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub os_version: Option<u32>,
+    pub os_version: Option<String>,
+    /// Human form "Y-MM" (boot only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_patch_level: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,12 +52,6 @@ pub struct ImageSpec {
     pub dtb_addr: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_size: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table_size: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table_entry_num: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub table_entry_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootconfig_size: Option<u32>,
 }
@@ -72,12 +68,6 @@ pub struct RamdiskSpec {
     /// "decompressed" (file holds cpio) or "raw" (file holds image bytes).
     pub on_disk: String,
     pub declared_size: u32,
-    pub declared_offset: u32,
-    pub valid: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub entries: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub why_invalid: Option<String>,
     /// 64 board_id bytes as 128 hex chars; absent = all zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_id_hex: Option<String>,
@@ -92,25 +82,6 @@ pub struct BlobSpec {
     pub stored_format: String,
     pub on_disk: String,
     pub declared_size: u32,
-    pub available_size: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RescueSpec {
-    /// Whole-blob rescue for stale-table images (decompressed cpio).
-    pub file: String,
-    pub stored_format: String,
-    pub entries: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FooterSpec {
-    pub size: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    pub all_zero: bool,
 }
 
 pub fn write_spec(dir: &Path, spec: &Spec) -> Result<()> {
@@ -152,4 +123,64 @@ pub(crate) fn hex_decode(s: &str) -> Result<Vec<u8>> {
         i += 2;
     }
     Ok(out)
+}
+
+/// Split the os_version bitfield into human ("A.B.C", "Y-MM") strings.
+pub(crate) fn os_human(os_version: u32) -> Option<(String, String)> {
+    if os_version == 0 {
+        return None;
+    }
+    let version = os_version >> 11;
+    let patch = os_version & 0x7ff;
+    let a = (version >> 14) & 0x7f;
+    let b = (version >> 7) & 0x7f;
+    let c = version & 0x7f;
+    let y = (patch >> 4) + 2000;
+    let m = patch & 0xf;
+    Some((format!("{a}.{b}.{c}"), format!("{y}-{m:02}")))
+}
+
+/// Encode human ("A.B.C", "Y-MM") strings back into the bitfield.
+/// Either side may be absent (None) to keep the current half.
+pub(crate) fn os_encode(cur: u32, v: Option<&str>, p: Option<&str>) -> Result<u32> {
+    let mut version = cur >> 11;
+    let mut patch = cur & 0x7ff;
+    if let Some(v) = v {
+        let mut it = v.split('.');
+        let a: u32 = it
+            .next()
+            .ok_or_else(|| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?
+            .parse()
+            .map_err(|_| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?;
+        let b: u32 = it
+            .next()
+            .ok_or_else(|| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?
+            .parse()
+            .map_err(|_| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?;
+        let c: u32 = it
+            .next()
+            .ok_or_else(|| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?
+            .parse()
+            .map_err(|_| Error::Parse(format!("bad os_version '{v}' (want A.B.C)")))?;
+        if a > 127 || b > 127 || c > 127 {
+            return Err(Error::Parse(format!("bad os_version '{v}' (parts fit in 7 bits)")));
+        }
+        version = (a << 14) | (b << 7) | c;
+    }
+    if let Some(p) = p {
+        let (y, m) = p
+            .split_once('-')
+            .ok_or_else(|| Error::Parse(format!("bad os_patch_level '{p}' (want Y-MM)")))?;
+        let y: u32 = y
+            .parse()
+            .map_err(|_| Error::Parse(format!("bad os_patch_level '{p}' (want Y-MM)")))?;
+        let m: u32 = m
+            .parse()
+            .map_err(|_| Error::Parse(format!("bad os_patch_level '{p}' (want Y-MM)")))?;
+        if y < 2000 || m > 12 {
+            return Err(Error::Parse(format!("bad os_patch_level '{p}' (want Y-MM)")));
+        }
+        patch = ((y - 2000) << 4) | m;
+    }
+    Ok((version << 11) | patch)
 }

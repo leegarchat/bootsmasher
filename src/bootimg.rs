@@ -141,11 +141,13 @@ pub fn parse(img: &[u8]) -> Result<BootImage> {
             "Samsung PXA header suspected (page field {page_field:#x}); refusing to guess"
         )));
     }
-    // v3/v4 have cmdline at a different place and no tags/page words;
-    // detect by trying v3 shape: header_version at offset 32 must be 3/4
-    // AND the v0 page field must look insane for a page size.
-    let v3ver = u32le(img, 32, "v3 header_version").unwrap_or(99);
-    let looks_v3 = (v3ver == 3 || v3ver == 4) && (page_field == 0 || page_field > 65536);
+    // v3/v4 have a completely different layout (fixed 4096 page, version
+    // word at offset 40, cmdline at 44). Detect by the version word plus
+    // a sane v3/v4 header_size (1580/1584); v0 images carry page_size and
+    // tags_addr in the low words instead.
+    let v3ver = u32le(img, 40, "v3 header_version").unwrap_or(99);
+    let hsz_field = u32le(img, 20, "header_size").unwrap_or(0);
+    let looks_v3 = (v3ver == 3 || v3ver == 4) && (hsz_field == 1580 || hsz_field == 1584);
     if looks_v3 {
         return parse_v3v4(img, v3ver);
     }
@@ -240,6 +242,8 @@ fn parse_v0v1v2(img: &[u8], tags: u32, page: u32, ver_field: u32) -> Result<Boot
 }
 
 fn parse_v3v4(img: &[u8], version: u32) -> Result<BootImage> {
+    // v3: 8 magic + k(4) r(4) os(4) hsz(4) + reserved[4](16) + ver(4) +
+    // cmdline(1536) = 1580 bytes; v4 appends signature_size(4) = 1584.
     if img.len() < 1580 {
         return Err(Error::Parse("boot image too small for v3 header".to_string()));
     }
@@ -247,13 +251,13 @@ fn parse_v3v4(img: &[u8], version: u32) -> Result<BootImage> {
     let ramdisk_size = u32le(img, 12, "ramdisk_size")?;
     let os_version = u32le(img, 16, "os_version")?;
     let header_size = u32le(img, 20, "header_size")?;
-    let cmdline = cstr(&img[40..1576]);
+    let cmdline = cstr(&img[44..1580]);
     let mut signature_size = 0u32;
     if version == 4 {
         if img.len() < 1584 {
             return Err(Error::Parse("boot image too small for v4 signature_size".to_string()));
         }
-        signature_size = u32le(img, 1576, "signature_size")?;
+        signature_size = u32le(img, 1580, "signature_size")?;
     }
     let page_us = 4096usize;
     let hdr = BootHeader {
@@ -368,15 +372,15 @@ pub fn serialize(h: &BootHeader) -> Result<Vec<u8>> {
             out[12..16].copy_from_slice(&h.ramdisk_size.to_le_bytes());
             out[16..20].copy_from_slice(&h.os_version.to_le_bytes());
             out[20..24].copy_from_slice(&h.header_size.to_le_bytes());
-            // reserved[4] stays zero
-            out[36..40].copy_from_slice(&h.version.to_le_bytes());
+            // reserved[4] at 24..40 stays zero
+            out[40..44].copy_from_slice(&h.version.to_le_bytes());
             let c = h.cmdline.len().min(1536);
-            out[40..40 + c].copy_from_slice(&h.cmdline[..c]);
-            for b in out[40 + c..1576].iter_mut() {
+            out[44..44 + c].copy_from_slice(&h.cmdline[..c]);
+            for b in out[44 + c..1580].iter_mut() {
                 *b = 0;
             }
             if h.version == 4 {
-                out[1576..1580].copy_from_slice(&h.signature_size.to_le_bytes());
+                out[1580..1584].copy_from_slice(&h.signature_size.to_le_bytes());
             }
             Ok(out)
         }

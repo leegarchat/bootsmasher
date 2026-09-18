@@ -212,7 +212,7 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
                 available: f.size as usize,
                 valid: f.valid,
                 stored_format: match f.kind {
-                    BlobKind::Lz4Legacy => "lz4-legacy".to_string(),
+                    BlobKind::Lz4Legacy => "lz4_legacy".to_string(),
                     BlobKind::Cpio => "cpio".to_string(),
                     BlobKind::Unknown => "unknown".to_string(),
                 },
@@ -247,7 +247,11 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
             dtb_declared: im.hdr.dtb_size,
             dtb_available: im.hdr.dtb_size as usize,
             dtb_fdts: a.dtb_fdts,
-            dtb_why: "ok".to_string(),
+            dtb_why: if im.hdr.dtb_size == 0 {
+                "absent (dtb_size 0)".to_string()
+            } else {
+                "ok".to_string()
+            },
             bootconfig_declared: im.hdr.bootconfig_size,
             bootconfig_available: im.bootconfig.len(),
             whole_blob_single_stream: a.stale_table || whole > 0,
@@ -379,7 +383,7 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
             available: have,
             valid: valid && have == want,
             stored_format: match kind {
-                BlobKind::Lz4Legacy => "lz4-legacy".to_string(),
+                BlobKind::Lz4Legacy => "lz4_legacy".to_string(),
                 BlobKind::Cpio => "cpio".to_string(),
                 BlobKind::Unknown => "unknown".to_string(),
             },
@@ -404,10 +408,13 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
             ),
         });
     }
-    // DTB on available bytes.
+    // DTB on available bytes (size 0 = absent, legal).
     d.dtb_declared = hdr.dtb_size;
     d.dtb_available = dtb_end.min(bytes.len()).saturating_sub(dtb_start.min(bytes.len()));
-    if dtb_start >= bytes.len() {
+    if hdr.dtb_size == 0 {
+        d.dtb_fdts = 0;
+        d.dtb_why = "absent (dtb_size 0)".to_string();
+    } else if dtb_start >= bytes.len() {
         d.dtb_why = "no bytes: dtb starts past file end".to_string();
     } else if d.dtb_available < hdr.dtb_size as usize {
         d.dtb_why = format!(
@@ -435,9 +442,10 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
             }
         }
     }
+    let dtb_ok = d.dtb_why == "ok" || d.dtb_why.starts_with("absent");
     d.overall_ok = d.frags.iter().all(|f| f.valid)
         && d.table_why == "ok"
-        && d.dtb_why == "ok"
+        && dtb_ok
         && d.bootconfig_available == d.bootconfig_declared as usize
         && ram_end <= bytes.len()
         && bc_end <= bytes.len();
@@ -453,7 +461,7 @@ fn check_fragment(blob: &[u8]) -> (BlobKind, bool, String, Option<Vec<u8>>) {
                     (
                         BlobKind::Lz4Legacy,
                         true,
-                        format!("lz4-legacy ({blocks} blocks) decompresses to cpio with {n} entries"),
+                        format!("lz4_legacy ({blocks} blocks) decompresses to cpio with {n} entries"),
                         Some(dec),
                     )
                 }

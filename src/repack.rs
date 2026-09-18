@@ -20,61 +20,122 @@ use crate::vboot::ops;
 use crate::vboot::space;
 
 const HELP: &str = "bootsmasher repack — rebuild boot/vendor_boot from an unpack dir
+Aliases: r, rp.
 
 Usage:
   bootsmasher repack [dir=\".\"] [out=\"new-boot.img\"] [options]
   bootsmasher repack --help
 
-Layout source (need one of):
-  dir/spec.toml            Full-fidelity record from 'bootsmasher unpack':
-                           kind, version, page, every scalar, per-section
-                           formats/sizes, footer. A repack from the dir alone
+Layout source (need one of; checked in this order):
+  dir/spec.toml            Lean record from 'bootsmasher unpack': kind,
+                           version, page, header scalars, per-section
+                           file/format/size (+ names/types/board_id for
+                           vendor ramdisks). A repack from the dir alone
                            works when every nonzero section has its file.
-  --base <img>             Original image (magiskboot parity): sizes, formats
-                           and missing-file bytes come from it. Without spec
-                           the table/names/types come from the base image.
-  --template <img>         Foreign image: header scalars (cmdline, name,
+                           Sizes in spec are advisory: all header sizes
+                           and table offsets are recomputed from the real
+                           file bytes, so editing files never breaks the
+                           build (spec sizes are only used in the
+                           'missing file' error text).
+  --base <img> (-b)        Original image (magiskboot parity): sizes,
+                           formats and missing-file bytes come from it.
+                           Without spec the table names/types come from
+                           the base image table.
+  --template <img> (-t)    Foreign image: header scalars (cmdline, name,
                            addrs, page, os_version...) are taken from it;
                            section bytes still come from dir/--base.
+                           Example: LOS ramdisk + stock cmdline.
+
+Options:
+  -o <file>, --out <file>  Output image path. Default: positional [out],
+                           default new-boot.img. -o and positional out
+                           together are an error.
+  -b <img>, --base <img>   See above.
+  -t <img>, --template <img>  See above.
+  -s k=v, --set k=v        Header scalar override, repeatable, wins over
+                           everything except a later --set. Keys:
+                             cmdline        free text (may contain spaces
+                                            if quoted by the shell)
+                             name           product name (<= 16 chars)
+                             os_version     A.B.C, 7-bit parts (boot only)
+                             os_patch_level Y-MM, e.g. 2026-09 (boot only)
+                             page_size      2048 / 4096 (decimal or 0x...)
+                             kernel_addr | ramdisk_addr | second_addr |
+                             tags_addr      32-bit load addresses
+                             dtb_addr       64-bit load address
+                           Unknown keys and boot-only keys on vendor_boot
+                           are usage errors (exit 1), never silent.
+  -f target=fmt, --format target=fmt
+                           Compression target, repeatable. Target is a file
+                           name (kernel, ramdisk.cpio, dlkm.cpio, dtb...)
+                           or a group: 'ramdisk' (every ramdisk fragment)
+                           or 'all'. Formats:
+                             raw | gzip | xz | lzma | lz4 | lz4_legacy
+                           ('none'/'cpio' also mean raw; 'lz4_lg' means
+                           lz4_legacy). Precedence per section: exact file
+                           match > ramdisk-group > all > spec
+                           stored_format > --base detected format > raw.
+  -n                       Skip all compression: every present file is
+                           copied verbatim (magiskboot parity for -n).
+                           Unpack -n + repack -n is byte-identical to the
+                           source prefix.
+  --drop-footer            Omit trailing bytes (dir/footer.bin or base
+                           tail). Shrinks the image; use with --pad-to to
+                           re-pad to the block-device size.
+  --pad-to <bytes>         Append zeros up to this size (e.g. 67108864).
+                           Fails (nothing written) if the image is bigger.
+  --min-free <size>        Reserve: output dir must fit image + reserve.
+                           Plain bytes or human (512M, 1GiB, 1.5G; K/M/G/T
+                           are binary). Default 0.
+  --check-dir <dir>        Check free space in <dir> instead of the output
+                           file's parent directory.
 
 Header scalar precedence (later wins):
   spec.toml (or --base) -> dir/header (magiskboot parity: name, cmdline,
   os_version, os_patch_level) -> --template -> --set k=v.
-  --set keys: cmdline | name | os_version (A.B.C) | os_patch_level (Y-MM) |
-              page_size | kernel_addr | ramdisk_addr | second_addr |
-              tags_addr | dtb_addr. os_version/* are boot-only; addrs and
-  page_size apply to both kinds (vendor_boot has no os_version).
 
-Component formats:
-  Default per section: --format target=fmt, else spec stored_format, else
-  --base detected format, else raw. Target is a file name (ramdisk.cpio,
-  kernel, dlkm.cpio...), or group 'ramdisk' (every ramdisk fragment) or
-  'all'. v4 boot ramdisk is forced to lz4_legacy like magiskboot does
-  (GKI merge rule), unless -n or an explicit --format says otherwise.
-  A file that already sniffs as compressed is copied verbatim (magiskboot
-  parity); a raw cpio/text file is compressed to the target format.
-  -n skips all compression (verbatim bytes, possibly an invalid image).
+Component formats in detail:
+  A file that already sniffs as compressed is copied verbatim
+  (magiskboot parity); a raw cpio/text file is compressed to the target
+  format. v4 boot ramdisk is forced to lz4_legacy like magiskboot does
+  (GKI merge rule: vendor ramdisks must share one method), unless -n or
+  an explicit --format says otherwise — the forcing is reported as
+  'RAMDISK_FMT: [old] -> [lz4_legacy]'.
 
 Vendor_boot specifics:
-  The ramdisk table is rebuilt: offsets rechained, sizes from the new
-  blobs, types/names from spec (or --base table), board_id from
-  spec board_id_hex. dtb/bootconfig from files, else --base.
+  The ramdisk table is rebuilt from scratch: offsets rechained from the
+  new blob sizes, types/names from spec (or --base table), board_id from
+  spec board_id_hex (128 hex chars = 64 bytes, absent = zeros).
+  dtb/bootconfig come from files, else --base bytes, else a clean error
+  naming the missing size.
+
 Boot specifics:
   kernel + kernel_dtb files concatenate (kernel_dtb is honored only with
-  an explicit kernel file); recovery_dtbo offset is refreshed; v4
-  signature from file, else --base bytes. dtb is NOT split out of kernel.
+  an explicit kernel file; otherwise a warning, base bytes kept). The
+  recovery_dtbo offset field is refreshed to the real position. v4
+  signature comes from the file, else --base bytes. dtb is NOT split out
+  of kernel on repack (only on unpack).
 
-Footer:
-  Kept by default: dir/footer.bin, else --base trailing bytes.
-  --drop-footer omits it (sizes shrink; AVB hashes never survive content
-  changes anyway — resign afterwards if the chain matters).
+Footer and AVB:
+  Kept by default: dir/footer.bin (written by unpack, not recorded in
+  spec), else --base trailing bytes (vbmeta + AVB footer). --drop-footer
+  omits it. AVB hashes never survive content changes anyway — resign the
+  image afterwards if the verified-boot chain matters.
 
 Output:
-  Always a file (default new-boot.img). --pad-to appends zeros (e.g.
-  67108864 for the block device). Free space is checked first: the output
-  file's parent (or --check-dir) must fit image + --min-free (bytes or
-  human like 512M, default 0). The rebuilt image is re-parsed and every
-  section re-verified in memory; on failure nothing is written.
+  Always a file (default new-boot.img). --pad-to appends zeros. Free
+  space is checked first (output parent or --check-dir must fit image +
+  --min-free). The rebuilt image is re-parsed and every section
+  re-verified in memory (ramdisk cpio, FDTs, table chaining); on failure
+  nothing is written (exit 2).
+
+Typical sessions:
+  bootsmasher repack dir fixed.img
+  bootsmasher r dir fox.img -b stock.img -f ramdisk.cpio=gzip
+  bootsmasher repack pinit/ init_new.img --set cmdline=\"console=ttyS0\" -n
+  bootsmasher repack dir out.img --drop-footer --pad-to 67108864
+  bootsmasher repack broken-dir/ out.img --base broken.img
+    # refuses (exit 2): refuses to emit an invalid image
 
 Exit codes: 0 ok, 1 usage error, 2 broken input / failed verification.";
 
@@ -124,26 +185,34 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
             "-h" | "--help" => return Err(Error::Usage("help requested".to_string())),
             "-n" => no_compress = true,
             "--drop-footer" => drop_footer = true,
-            "--base" => {
+            "-o" | "--out" => {
                 i += 1;
-                base = Some(args.get(i).ok_or_else(|| Error::Usage("--base needs a value".to_string()))?.clone());
+                let v = args.get(i).ok_or_else(|| Error::Usage("-o/--out needs a value".to_string()))?.clone();
+                if out.is_some() {
+                    return Err(Error::Usage("out.img positionally and via -o/--out at once".to_string()));
+                }
+                out = Some(v);
             }
-            "--template" => {
+            "-b" | "--base" => {
+                i += 1;
+                base = Some(args.get(i).ok_or_else(|| Error::Usage("-b/--base needs a value".to_string()))?.clone());
+            }
+            "-t" | "--template" => {
                 i += 1;
                 template = Some(
-                    args.get(i).ok_or_else(|| Error::Usage("--template needs a value".to_string()))?.clone(),
+                    args.get(i).ok_or_else(|| Error::Usage("-t/--template needs a value".to_string()))?.clone(),
                 );
             }
-            "--set" => {
+            "-s" | "--set" => {
                 i += 1;
-                let kv = args.get(i).ok_or_else(|| Error::Usage("--set needs k=v".to_string()))?;
-                let (k, v) = kv.split_once('=').ok_or_else(|| Error::Usage("--set needs k=v".to_string()))?;
+                let kv = args.get(i).ok_or_else(|| Error::Usage("-s/--set needs k=v".to_string()))?;
+                let (k, v) = kv.split_once('=').ok_or_else(|| Error::Usage("-s/--set needs k=v".to_string()))?;
                 sets.push((k.to_string(), v.to_string()));
             }
-            "--format" => {
+            "-f" | "--format" => {
                 i += 1;
-                let kv = args.get(i).ok_or_else(|| Error::Usage("--format needs target=fmt".to_string()))?;
-                let (t, f) = kv.split_once('=').ok_or_else(|| Error::Usage("--format needs target=fmt".to_string()))?;
+                let kv = args.get(i).ok_or_else(|| Error::Usage("-f/--format needs target=fmt".to_string()))?;
+                let (t, f) = kv.split_once('=').ok_or_else(|| Error::Usage("-f/--format needs target=fmt".to_string()))?;
                 formats.push((t.to_string(), Format::parse(f)?));
             }
             "--pad-to" => {
@@ -169,7 +238,9 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
                 } else if out.is_none() {
                     out = Some(p.to_string());
                 } else {
-                    return Err(Error::Usage("too many positional arguments".to_string()));
+                    return Err(Error::Usage(
+                        "too many positional arguments (out.img positionally and via -o/--out at once?)".to_string(),
+                    ));
                 }
             }
         }
@@ -913,6 +984,7 @@ fn fmt_target(cli: &Cli, spec: Option<&spec::Spec>, base: Option<&[u8]>, file: &
 
 fn spec_boot_header(s: &spec::Spec) -> Result<bootimg::BootHeader> {
     let im = &s.image;
+    let os_version = spec::os_encode(0, im.os_version.as_deref(), im.os_patch_level.as_deref())?;
     Ok(bootimg::BootHeader {
         version: im.header_version,
         page_size: im.page_size,
@@ -923,7 +995,7 @@ fn spec_boot_header(s: &spec::Spec) -> Result<bootimg::BootHeader> {
         second_size: 0,
         second_addr: im.second_addr.unwrap_or(0),
         tags_addr: im.tags_addr.unwrap_or(0),
-        os_version: im.os_version.unwrap_or(0),
+        os_version,
         name: im.name.clone().map(|x| x.into_bytes()).unwrap_or_default(),
         cmdline: im.cmdline.clone().map(|x| x.into_bytes()).unwrap_or_default(),
         extra_cmdline: im.extra_cmdline.clone().map(|x| x.into_bytes()).unwrap_or_default(),

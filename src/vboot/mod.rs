@@ -21,7 +21,8 @@ use image::type_name;
 use lz4legacy::BlobKind;
 use ops::Mode;
 
-const HELP: &str = "bootsmasher vboot — smart vendor_boot repack (Pixel 6 / gs101, v0.1.0)
+const HELP: &str = "bootsmasher vboot — smart vendor_boot repair flow (Pixel 6 / gs101)
+Alias: vb.
 
 Usage:
   bootsmasher vboot <vboot.img> [platform.cpio|platform.cpio.lz4] [out.img]
@@ -29,44 +30,82 @@ Usage:
   bootsmasher vboot --verify <vboot.img> [platform] [--check-dir <dir>]
   bootsmasher vboot --help
 
+What it does:
+  Potрошит vendor_boot умным анализатором, а не наугад: каждый фрагмент
+  таблицы декомпрессируется и его cpio проверяется, сумма таблицы
+  сверяется с заголовком, FDT проходятся. Диагностирует протухшую
+  таблицу мейнтейнера (один поток + две записи) и чинит раскладку;
+  валидные образы проходят байт-в-байт, без пережатия.
+
 Layout modes (mutually exclusive):
-  (none)               Keep the layout: valid images round-trip verbatim,
-                       a stale single-stream table becomes one platform entry.
-                       With a platform file the platform is replaced; a valid
-                       original dlkm is kept as fallback, otherwise lib/**
-                       is pulled out of the new platform into a fresh dlkm.
-  --split-first-stage  Partition content into fragments by subtree:
+  (none)               Keep the layout: valid images round-trip verbatim
+                       (fragment bytes are copied, never recompressed);
+                       a stale single-stream table becomes one platform
+                       entry. With a platform file the platform is
+                       replaced; a valid original dlkm is kept as
+                       fallback, otherwise lib/** is pulled out of the
+                       new platform into a fresh dlkm fragment.
+  --split-first-stage (--split)
+                       Partition content into fragments by subtree:
                        first_stage_ramdisk/** + rest -> platform,
-                       recovery/** + debug_ramdisk/** -> recovery,
-                       lib/** -> dlkm. A dlkm/recovery fragment is emitted
-                       only when it carries real files (not bare dirs); when
-                       the new content yields no dlkm but the original dlkm
-                       is valid, it is kept byte-identically.
+                       recovery/** + debug_ramdisk/** -> recovery
+                       (name=\"recovery\", type=2),
+                       lib/** -> dlkm. A dlkm/recovery fragment is
+                       emitted only when it carries real files (a bare
+                       lib or debug_ramdisk dir alone is not worth a
+                       fragment); when the new content yields no dlkm
+                       but the original dlkm is valid, it is kept
+                       byte-identically.
   --merge              Glue everything into a single platform fragment
-                       (platform slots replaced by the new file when given,
-                       original dlkm/recovery content joins it).
+                       (platform slots replaced by the new file when
+                       given, original dlkm/recovery content joins it;
+                       mid-stream TRAILERs are dropped, exactly one is
+                       written). Fragments are re-encoded marker-free
+                       LZ4-legacy, like kernel ramdisks (the lz4 CLI
+                       treats a zero word as corruption, so no end
+                       marker is written).
+
+Platform file formats:
+  platform.cpio.lz4 stays verbatim after validation; a raw
+  platform.cpio is compressed to LZ4-legacy. Anything else
+  (erofs blob, garbage slice) is a usage error, never guessed.
 
 Behavior:
   Header flags, cmdline, dtb and bootconfig are always preserved.
   The rebuilt image is fully re-verified in memory before anything is
-  emitted; on any failure nothing is written and the error goes to stderr.
+  emitted; on any failure nothing is written and the error goes to
+  stderr (never to stdout — the pipe stays clean).
 
 Output:
-  With an output path the image is written to the file. Without one the
-  image bytes go to stdout with no other stdout output. --pad-to appends
-  zero bytes up to the given size (e.g. 67108864 for the block device).
-  Before writing, free space is checked: free(dir) must cover the image
-  plus --min-free (default 0; plain bytes or human sizes like 512M, 1GiB).
-  The checked dir is the output file's parent (or --check-dir override);
-  for stdout output the check runs only with --check-dir.
+  With an output path (-o/--out or positional) the image is written to
+  the file. Without one the image bytes go to stdout with no other
+  stdout output. --pad-to appends zero bytes up to the given size
+  (e.g. 67108864 for the block-device size). Before writing, free space
+  is checked: free(dir) must cover the image plus --min-free (default
+  0; plain bytes or human sizes like 512M, 1GiB, 1.5G — K/M/G/T are
+  binary). The checked dir is the output file's parent (or --check-dir
+  override); for stdout output the check runs only with --check-dir.
 
 Verify:
-  Without a platform file: print the fragment table verdict (exit 0 only
-  when fully self-consistent). With a platform file: dry-run the whole
-  pipeline in memory — print the resulting layout, the resulting size and
-  the space verdict — and write nothing (checked dir defaults to '.').
+  Without a platform file: print the fragment table verdict (exit 0
+  only when fully self-consistent), e.g.
+    OK image: header v4, page 2048, ramdisk 28987491, 2 fragment(s)...
+    INVALID image: ... [STALE TABLE, single stream]
+      frag 0 platform: lz4 block 6 truncated (need 3970208, have 1175831)
+  With a platform file: dry-run the whole pipeline in memory — print
+  the resulting layout, the resulting size and the space verdict — and
+  write nothing (checked dir defaults to '.').
 
-Exit codes: 0 ok, 1 usage error, 2 broken input / verification failure.";
+Typical sessions:
+  bootsmasher vboot --verify vendor_boot.img
+  bootsmasher vb broken.img -o fixed.img
+  bootsmasher vboot stock.img OrangeFox.ramdisk.lz4 -o fox_boot.img
+  bootsmasher vboot broken.img full.cpio --split -o frag.img
+  bootsmasher vboot stock.img --merge -o single.img
+  bootsmasher vboot broken.img fox.lz4 --pad-to 67108864 --min-free 1G -o fox_64m.img
+  bootsmasher vboot broken.img > fixed.img   # stdout = pure image bytes
+
+Exit codes: 0 ok, 1 usage error, 2 broken input / failed verification.";
 
 pub fn run(args: &[String]) -> i32 {
     match run_inner(args) {
@@ -108,7 +147,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
         match args[i].as_str() {
             "-h" | "--help" => return Err(Error::Usage("help requested".to_string())),
             "--verify" => verify_only = true,
-            "--split-first-stage" => {
+            "--split-first-stage" | "--split" => {
                 if mode == Mode::Merge {
                     return Err(Error::Usage("--split-first-stage conflicts with --merge".to_string()));
                 }
@@ -194,7 +233,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
 
 fn kind_str(k: BlobKind) -> &'static str {
     match k {
-        BlobKind::Lz4Legacy => "lz4-legacy",
+        BlobKind::Lz4Legacy => "lz4_legacy",
         BlobKind::Cpio => "cpio",
         BlobKind::Unknown => "unknown",
     }

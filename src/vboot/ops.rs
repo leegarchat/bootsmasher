@@ -711,6 +711,61 @@ fn split_entries(
     Ok((frags, table))
 }
 
+/// Valid original fragments to carry over verbatim when the platform is
+/// replaced: everything that is not platform (it gets replaced) and not
+/// already produced by the new layout (tracked as (type, name) pairs).
+/// This is what keeps foreign fragments like shiba's "16K" (type none,
+/// 16K-page kernel modules) or a recovery fragment alive across a
+/// platform swap instead of silently dropping 17 MB of modules.
+/// Unreadable originals are skipped with a stderr note, never propagated.
+fn carryovers(im: &Image, produced: &[(u32, String)]) -> Vec<(RamdiskEntry, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (i, e) in im.table.iter().enumerate() {
+        if e.entry_type == TYPE_PLATFORM {
+            continue;
+        }
+        if produced.iter().any(|(t, n)| *t == e.entry_type && *n == e.name_str()) {
+            continue;
+        }
+        match im.frag_bytes(i) {
+            Ok(b) if check_fragment(b).1 => {
+                let mut ne = e.clone();
+                ne.size = b.len() as u32;
+                ne.offset = 0; // rechained by the caller
+                out.push((ne, b.to_vec()));
+            }
+            _ => eprintln!(
+                "warning: original {} fragment {:?} unreadable, not carried over",
+                type_name(e.entry_type),
+                e.name_str()
+            ),
+        }
+    }
+    out
+}
+
+/// Append carryovers to a (frags, table) pair, rechaining offsets.
+fn append_carryovers(
+    frags: &mut Vec<Vec<u8>>,
+    table: &mut Vec<RamdiskEntry>,
+    im: &Image,
+    produced: &[(u32, String)],
+) {
+    let mut off: u32 = frags.iter().map(|f| f.len() as u32).sum();
+    for (mut e, raw) in carryovers(im, produced) {
+        e.offset = off;
+        off += raw.len() as u32;
+        eprintln!(
+            "carried over {} fragment {:?} verbatim ({} bytes)",
+            type_name(e.entry_type),
+            e.name_str(),
+            raw.len()
+        );
+        frags.push(raw);
+        table.push(e);
+    }
+}
+
 /// Main repack routine.
 ///
 /// - `platform`: optional (path label, bytes) replacement content.
@@ -797,17 +852,24 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
                 Error::Parse(format!("internal error re-reading new platform: {e}"))
             })?;
             let (plat_entries, _, lib_entries) = cpio::partition(&entries);
+            let mut frags: Vec<Vec<u8>>;
+            let mut table: Vec<RamdiskEntry>;
+            // produced[] tracks (type, name) for the carryover filter.
+            let mut produced: Vec<(u32, String)> = vec![(TYPE_PLATFORM, String::new())];
             if let Some(dlkm_raw) = orig_valid_dlkm_raw {
                 // Valid original dlkm wins as fallback; new platform keeps
                 // its own files untouched (verbatim bytes).
                 let off = new_plat_raw.len() as u32;
                 let e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
                 let e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, off);
-                (vec![new_plat_raw, dlkm_raw], vec![e0, e1])
+                frags = vec![new_plat_raw, dlkm_raw];
+                table = vec![e0, e1];
+                produced.push((TYPE_DLKM, "dlkm".to_string()));
             } else if !cpio::has_payload(&lib_entries) {
-                // No dlkm content anywhere: platform-only image.
+                // No dlkm content anywhere: platform plus carryovers.
                 let e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
-                (vec![new_plat_raw], vec![e0])
+                frags = vec![new_plat_raw];
+                table = vec![e0];
             } else {
                 // Fallback: pull lib out of the new platform into dlkm.
                 let plat_cpio = cpio::build(&plat_entries);
@@ -816,8 +878,12 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
                 let dlkm_raw = lz4legacy::compress_legacy(&dlkm_cpio);
                 let e0 = RamdiskEntry::platform(plat_raw.len() as u32);
                 let e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, plat_raw.len() as u32);
-                (vec![plat_raw, dlkm_raw], vec![e0, e1])
+                frags = vec![plat_raw, dlkm_raw];
+                table = vec![e0, e1];
+                produced.push((TYPE_DLKM, "dlkm".to_string()));
             }
+            append_carryovers(&mut frags, &mut table, &im, &produced);
+            (frags, table)
         }
         (Some((label, data)), Mode::Merge) => {
             let new_plat_raw = normalize_input(label, &data)?;
@@ -840,7 +906,11 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
             // but the original dlkm is valid, keep it byte-identically.
             let (_, _, lib_check) = cpio::partition(&entries);
             let fallback = if cpio::has_payload(&lib_check) { None } else { orig_valid_dlkm_raw };
-            split_entries(entries, fallback)?
+            let (mut frags, mut table) = split_entries(entries, fallback)?;
+            let produced: Vec<(u32, String)> =
+                table.iter().map(|e| (e.entry_type, e.name_str())).collect();
+            append_carryovers(&mut frags, &mut table, &im, &produced);
+            (frags, table)
         }
     };
 

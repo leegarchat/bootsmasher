@@ -44,7 +44,10 @@ Layout modes (mutually exclusive):
                        entry. With a platform file the platform is
                        replaced; a valid original dlkm is kept as
                        fallback, otherwise lib/** is pulled out of the
-                       new platform into a fresh dlkm fragment.
+                       new platform into a fresh dlkm fragment. Any other
+                       valid original fragments (shiba's \"16K\", recovery)
+                       are carried over verbatim, rechained — never
+                       silently dropped.
   --split-first-stage (--split)
                        Partition content into fragments by subtree:
                        first_stage_ramdisk/** + rest -> platform,

@@ -1,0 +1,31 @@
+[package]
+name = "bootsmasher"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "bootsmasher — standalone static binary for Android vendor_boot v4 analysis and repack (Pixel 6 / gs101 specialization in 0.1.0)"
+repository = "https://github.com/anomalyco/opencode"
+
+[[bin]]
+name = "bootsmasher"
+path = "src/main.rs"
+
+[dependencies]
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "frame"] }
+# Pure-Rust codecs for the unpack/repack subprograms (no C code anywhere).
+flate2 = "1"
+lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "xz"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+
+# statvfs binding for the pre-write free-space check (Unix only).
+# No C code of ours, links against the system libc like any Rust binary.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

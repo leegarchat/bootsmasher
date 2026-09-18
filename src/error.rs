@@ -7,6 +7,9 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Error {
     Usage(String),
+    /// Operational failure with exit code 1 but no help dump
+    /// (cpio `exists` on a missing entry, like magiskboot).
+    Fail(String),
     Io(String),
     Parse(String),
     Verify(String),
@@ -15,7 +18,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Usage(m) | Error::Io(m) | Error::Parse(m) | Error::Verify(m) => write!(f, "{m}"),
+            Error::Usage(m) | Error::Fail(m) | Error::Io(m) | Error::Parse(m) | Error::Verify(m) => {
+                write!(f, "{m}")
+            }
         }
     }
 }

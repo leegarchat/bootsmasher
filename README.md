@@ -1,5 +1,5 @@
 # bootsmasher
-Standalone static CLI for Android boot-image surgery. Three subprograms
+Standalone static CLI for Android boot-image surgery. Four subprograms
 (short aliases in brackets):
 
 - `vboot` [`vb`] — smart `vendor_boot` repair flow (Pixel 6 specialization):
@@ -12,6 +12,8 @@ Standalone static CLI for Android boot-image surgery. Three subprograms
 - `repack` [`r`|`rp`] — rebuild from an unpack dir: `spec.toml` or
   `--base` (`-b`), `--template` (`-t`), `--set` (`-s`), `--format` (`-f`),
   footer control, pre-write verify.
+- `cpio` [`c`] — in-place newc archive surgery, faithful magiskboot
+  port: `exists/ls/rm/mkdir/ln/mv/add/extract/test/patch/backup/restore`.
 
 `bootsmasher help [subprogram]` prints a subprogram manual; every
 subprogram also answers `--help`. Exit codes everywhere: 0 ok, 1 usage
@@ -74,6 +76,34 @@ bootsmasher repack [dir="."] [out="new-boot.img"] [-b <img>] [-t <img>]
   `--drop-footer`. Output re-parsed and re-verified in memory; on
   failure nothing is written. Space gate: output dir must fit image +
   `--min-free` (bytes or `512M`).
+
+## cpio (`c`)
+
+```text
+bootsmasher cpio <incpio> [commands...]
+```
+
+Faithful port of magiskboot's cpio: in-place newc (`070701`) archive
+surgery. Each command is one shell-quoted argument; the file is
+rewritten after the last command (`ls`/`test`/`exists` only report and
+exit without writing; a missing `<incpio>` starts an empty archive).
+Input must be raw newc — `unpack` without `-n` already writes it, or
+decompress the `.lz4` first.
+
+Commands: `exists ENTRY` (0/1) | `ls [-r] [PATH]` | `rm [-r] ENTRY` |
+`mkdir MODE ENTRY` (octal) | `ln TARGET ENTRY` | `mv SOURCE DEST` |
+`add MODE ENTRY INFILE` | `extract [ENTRY OUT]` |
+`test` (0 stock / 1 Magisk / 2 unsupported) |
+`patch` (fstab verify/avb/forceencrypt strip, `KEEPVERITY` /
+`KEEPFORCEENCRYPT=true` keeps) | `backup ORIG [-n]` (diff into
+`.backup/`, xz unless `-n`) | `restore` (xz entries decompressed back).
+
+```sh
+bootsmasher cpio ramdisk.cpio "exists init" "ls -r /system"
+bootsmasher c ramdisk.cpio "add 644 new.rc ./new.rc" "ls new.rc"
+bootsmasher cpio ramdisk.cpio patch
+bootsmasher cpio ramdisk.cpio test; echo $?
+```
 
 ```sh
 bootsmasher unpack vendor_boot.img -o dir -h -x
@@ -198,11 +228,12 @@ verdicts, byte-identical round-trips, verbatim dlkm keep, stdout purity,
 Cargo.toml            lz4_flex + flate2 + lzma-rust2 + serde/toml (+ libc statvfs on Unix);
                       release: LTO fat, abort, strip
 build.sh              static multi-arch builder (linux musl x4 + windows gnu x2)
-src/main.rs           subprogram dispatch (vboot | unpack | repack)
-src/error.rs          single error type, stderr-only diagnostics
+src/main.rs           subprogram dispatch (vboot | unpack | repack | cpio)
+src/error.rs          error type (Usage/Fail/Io/Parse/Verify), stderr-only diagnostics
 src/bootimg.rs        ANDROID! v0..v4 parse/serialize, kernel_dtb split
 src/codec.rs          gzip/xz/lzma/lz4-frame/lz4-legacy sniff + transcode
 src/cpiox.rs          cpio-to-directory extraction (safe paths, symlinks, modes)
+src/cpio_cmd.rs       cpio subprogram (magiskboot port: 12 in-place commands)
 src/spec.rs           spec.toml layout record (serde/toml, hex board_id)
 src/unpack.rs         unpack subprogram (boot + vendor, diagnose, rescue)
 src/repack.rs         repack subprogram (spec/base/template/set/format/footer)
@@ -213,10 +244,11 @@ src/vboot/cpio.rs     newc parse/build/partition (lib/** = dlkm, recovery|debug_
 src/vboot/dtb.rs      concatenated-FDT walker
 src/vboot/ops.rs      analyzer + repack (Keep/Split/Merge) + pre-emit verifier + unpack diagnosis
 src/vboot/space.rs    size parsing + pre-write free-space check (statvfs / GetDiskFreeSpaceExW)
-test_vboot.sh         vboot suite (20 checks), test_compare_dlkm.py helper
-test_unpack_repack.sh unpack/repack suite (16 checks: GKI boot, init_boot,
+test_vboot.sh         vboot suite (21 checks incl. 16K carryover), test_compare_dlkm.py helper
+test_unpack_repack.sh unpack/repack/cpio suite (30 checks: GKI boot, init_boot,
                       recovery vendor_boot, roundtrips, -n identity, base
-                      fallback, set/format, refuse-invalid, template, space)
+                      fallback, set/format, refuse-invalid, template, space,
+                      edit-wins, aliases, cpio patch/backup/restore)
 ```
 
 ## License

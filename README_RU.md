@@ -1,6 +1,6 @@
 # bootsmasher
 
-Статичный самодостаточный CLI для хирургии Android boot-образов. Три подпрограммы (короткие алиасы в скобках):
+Статичный самодостаточный CLI для хирургии Android boot-образов. Четыре подпрограммы (короткие алиасы в скобках):
 
 - `vboot` [`vb`] — умный ремонтный флоу `vendor_boot` (специализация Pixel 6):
   нормализация протухшей таблицы, замена платформы,
@@ -12,6 +12,8 @@
 - `repack` [`r`|`rp`] — пересборка из каталога распаковки: `spec.toml` или
   `--base` (`-b`), `--template` (`-t`), `--set` (`-s`), `--format` (`-f`),
   управление футером, проверка перед записью.
+- `cpio` [`c`] — правка newc-архива на месте, точный порт magiskboot:
+  `exists/ls/rm/mkdir/ln/mv/add/extract/test/patch/backup/restore`.
 
 `bootsmasher help [подпрограмма]` печатает мануал подпрограммы; каждая
 подпрограмма также отвечает на `--help`. Коды выхода везде: 0 ок, 1 ошибка
@@ -81,6 +83,33 @@ bootsmasher u boot.img -o dir -n
 bootsmasher repack dir fixed.img
 bootsmasher r dir fox.img -b stock.img -f ramdisk.cpio=gzip
 bootsmasher repack pinit/ init_new.img --set cmdline="console=ttyS0" -n
+```
+
+## cpio (`c`)
+
+```text
+bootsmasher cpio <incpio> [команды...]
+```
+
+Точный порт cpio из magiskboot: правка newc-архива (`070701`) на месте.
+Каждая команда — один закавыченный аргумент шелла; файл перезаписывается
+после последней команды (`ls`/`test`/`exists` только сообщают и выходят
+без записи; отсутствующий `<incpio>` начинает пустой архив). Вход должен
+быть сырым newc — `unpack` без `-n` его уже пишет, либо распакуйте `.lz4`.
+
+Команды: `exists ENTRY` (0/1) | `ls [-r] [PATH]` | `rm [-r] ENTRY` |
+`mkdir MODE ENTRY` (восьмеричный) | `ln TARGET ENTRY` |
+`mv SOURCE DEST` | `add MODE ENTRY INFILE` | `extract [ENTRY OUT]` |
+`test` (0 stock / 1 Magisk / 2 unsupported) |
+`patch` (чистка verify/avb/forceencrypt из fstab, `KEEPVERITY` /
+`KEEPFORCEENCRYPT=true` сохраняет) | `backup ORIG [-n]` (дифф в
+`.backup/`, xz кроме `-n`) | `restore` (xz-записи распаковываются назад).
+
+```sh
+bootsmasher cpio ramdisk.cpio "exists init" "ls -r /system"
+bootsmasher c ramdisk.cpio "add 644 new.rc ./new.rc" "ls new.rc"
+bootsmasher cpio ramdisk.cpio patch
+bootsmasher cpio ramdisk.cpio test; echo $?
 ```
 
 ## Зачем
@@ -198,11 +227,12 @@ cargo build --release
 Cargo.toml            lz4_flex + flate2 + lzma-rust2 + serde/toml (+ libc-биндинг statvfs на Unix);
                       release: LTO fat, abort, strip
 build.sh              статическая мультиарх-сборка (linux musl x4 + windows gnu x2)
-src/main.rs           диспетчер подпрограмм (vboot | unpack | repack)
-src/error.rs          один тип ошибок, диагностика только в stderr
+src/main.rs           диспетчер подпрограмм (vboot | unpack | repack | cpio)
+src/error.rs          типы ошибок (Usage/Fail/Io/Parse/Verify), диагностика только в stderr
 src/bootimg.rs        парсинг/сборка ANDROID! v0..v4, отщепление kernel_dtb
 src/codec.rs          sniff + транскодинг gzip/xz/lzma/lz4-frame/lz4-legacy
 src/cpiox.rs          распаковка cpio в каталог (безопасные пути, симлинки, права)
+src/cpio_cmd.rs       подпрограмма cpio (порт magiskboot: 12 команд на месте)
 src/spec.rs           запись раскладки spec.toml (serde/toml, hex board_id)
 src/unpack.rs         подпрограмма unpack (boot + vendor, diagnose, rescue)
 src/repack.rs         подпрограмма repack (spec/base/template/set/format/footer)
@@ -213,10 +243,11 @@ src/vboot/cpio.rs     парсинг/сборка/разбиение newc (lib/*
 src/vboot/dtb.rs      проходчик склеенных FDT
 src/vboot/ops.rs      анализатор + перепаковка (Keep/Split/Merge) + предэмиссионный верифаер + диагноз для unpack
 src/vboot/space.rs    парсинг размеров + проверка места перед записью (statvfs / GetDiskFreeSpaceExW)
-test_vboot.sh         сьюта vboot (20 проверок), хелпер test_compare_dlkm.py
-test_unpack_repack.sh сьюта unpack/repack (16 проверок: GKI boot, init_boot,
+test_vboot.sh         сьюта vboot (21 проверка, вкл. carryover 16K), хелпер test_compare_dlkm.py
+test_unpack_repack.sh сьюта unpack/repack/cpio (30 проверок: GKI boot, init_boot,
                       recovery vendor_boot, roundtrip-ы, -n идентичность, base
-                      fallback, set/format, refuse-invalid, template, место)
+                      fallback, set/format, refuse-invalid, template, место,
+                      edit-wins, алиасы, cpio patch/backup/restore)
 ```
 
 ## Лицензия

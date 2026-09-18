@@ -1,10 +1,87 @@
 # bootsmasher
 
-Статичный самодостаточный CLI для хирургии Android boot-образов. Подпрограмма
-`vboot` (v0.1.0) анализирует и перепаковывает `vendor_boot` v3/v4, специализация
-— Pixel 6 (gs101, page size 2048). Только чистый Rust (`lz4_flex`), без внешних
-команд и C-зависимостей; статика musl под Linux (x86_64/x86/aarch64/armv7) и
-сборки MinGW под Windows (x86_64/aarch64).
+Статичный самодостаточный CLI для хирургии Android boot-образов. Три подпрограммы (короткие алиасы в скобках):
+
+- `vboot` [`vb`] — умный ремонтный флоу `vendor_boot` (специализация Pixel 6):
+  нормализация протухшей таблицы, замена платформы,
+  `--split-first-stage` (`--split`) / `--merge`, предэмиссионная проверка, режим stdout,
+  гейт места `--min-free`.
+- `unpack` [`u`|`up`] — извлечение в духе magiskboot для `boot.img` (v0..v4, ядра,
+  dtb/dtbo) **и** `vendor_boot`: автодекомпрессия, вердикты по секциям,
+  отчёт, который не падает (битые части всё равно дампятся, с точным ПОЧЕМУ).
+- `repack` [`r`|`rp`] — пересборка из каталога распаковки: `spec.toml` или
+  `--base` (`-b`), `--template` (`-t`), `--set` (`-s`), `--format` (`-f`),
+  управление футером, проверка перед записью.
+
+`bootsmasher help [подпрограмма]` печатает мануал подпрограммы; каждая
+подпрограмма также отвечает на `--help`. Коды выхода везде: 0 ок, 1 ошибка
+использования, 2 битый вход / провал проверки.
+
+Только чистый Rust (`lz4_flex`, `flate2`, `lzma-rust2`, `serde`/`toml`;
+биндинг `libc` statvfs только на Unix), без внешних команд и C-кода;
+статика musl под Linux (x86_64/x86/aarch64/armv7) и сборки MinGW/LLVM под
+Windows (x86_64/aarch64).
+
+## unpack (`u`, `up`)
+
+```text
+bootsmasher unpack <образ> [-h] [-n] [-o <каталог>] [-x] [--no-spec]
+```
+
+Сам определяет `ANDROID!`/`VNDRBOOT`, раскладывает файлы с именами как у
+magiskboot (`kernel`, `kernel_dtb`, `ramdisk.cpio`, `second`, `extra`,
+`recovery_dtbo`, `dtb`, `signature`, `bootconfig`, `header`, плюс
+`vendor_ramdisk/<имя>.cpio`, `footer.bin` и наш `spec.toml`):
+
+- `-h` пишет файл `header` как у magiskboot; `spec.toml` пишется всегда
+  (полная точность: форматы, размеры, board_id, футер), кроме `--no-spec`.
+- По умолчанию kernel/ramdisk/extra декомпрессируются на лету (формат по
+  магии: gzip/xz/lzma/lz4-frame/lz4-legacy); `-n` оставляет исходные байты.
+- Фрагмент, который не декомпрессируется, всё равно дампится КАК ЕСТЬ с
+  пометкой `INVALID` — прогон не абортится, как это делает magiskboot.
+- `-x`, `--extract` разворачивает каждый годный cpio в `<файл>.d/` (файлы,
+  каталоги, симлинки, unix-права).
+- По битым образам — ПОЧЕМУ по каждой секции (`block 6 truncated: need
+  X, have Y — таблица режет один поток посередине блока; сумма таблицы
+  vs заголовок, diff N`), а для протухшей таблицы vendor_boot —
+  `vendor_ramdisk/ramdisk.full-rescue.cpio` со всем бLOBом как одним
+  валидным потоком. Финал `RESULT: OK` (exit 0) или `RESULT: DEGRADED`
+  (тоже exit 0; exit 2 — только когда не читается даже заголовок).
+
+## repack (`r`, `rp`)
+
+```text
+bootsmasher repack [каталог="."] [выход="new-boot.img"] [-b <образ>] [-t <образ>]
+                   [-s k=v]... [-f цель=fmt]...
+                   [-n] [--drop-footer] [--pad-to N] [--min-free S]
+                   [--check-dir <каталог>]
+```
+
+- Раскладка из `каталог/spec.toml`; без него `--base` даёт размеры,
+  форматы и байты недостающих файлов (паритет magiskboot: заменяют только
+  присутствующие файлы). Без обоих раскладка неизвестна (exit 1).
+- Скаляры заголовка: spec/base → `каталог/header` (паритет magiskboot) →
+  `--template` → `--set` (`cmdline|name|os_version|os_patch_level|
+  page_size|kernel_addr|ramdisk_addr|second_addr|tags_addr|dtb_addr`).
+- Форматы посекционно (`--format ramdisk.cpio=gzip`, группы `ramdisk`/
+  `all`), по умолчанию из spec/base/детекта; ramdisk v4-boot форсится в
+  `lz4_legacy` (правило GKI-мержа, как у magiskboot); уже сжатые файлы
+  копируются как есть; `-n` отключает сжатие.
+- Таблица vendor пересобирается (офсеты перецепляются, имена/типы/
+  board_id сохраняются); у boot освежается офсет `recovery_dtbo`;
+  `kernel_dtb` учитывается при явном файле kernel.
+- Футер сохраняется (`footer.bin`, иначе хвост `--base`), кроме
+  `--drop-footer`. Выход перепарсивается и перепроверяется в памяти; при
+  провале ничего не пишется. Гейт места: каталог выхода должен вместить
+  образ + `--min-free` (байты или `512M`).
+
+```sh
+bootsmasher unpack vendor_boot.img -o dir -h -x
+bootsmasher u boot.img -o dir -n
+bootsmasher repack dir fixed.img
+bootsmasher r dir fox.img -b stock.img -f ramdisk.cpio=gzip
+bootsmasher repack pinit/ init_new.img --set cmdline="console=ttyS0" -n
+```
 
 ## Зачем
 
@@ -17,7 +94,7 @@
 не гадает, а проверяет: каждый фрагмент декомпрессируется и его cpio
 валидируется, сумма таблицы сверяется с заголовком, FDT проходятся.
 
-## Использование
+## Использование (`vb`)
 
 ```text
 bootsmasher vboot <vboot.img> [platform.cpio|platform.cpio.lz4] [out.img]
@@ -72,7 +149,7 @@ bootsmasher vboot --verify vendor_boot.img
 bootsmasher vboot broken_vendor_boot.img -o fixed.img
 bootsmasher vboot stock_vendor_boot.img OrangeFox.ramdisk.lz4 -o fox_boot.img
 bootsmasher vboot stock_vendor_boot.img --merge -o single.img
-bootsmasher vboot broken.img full.cpio --split-first-stage -o frag.img
+bootsmasher vboot broken.img full.cpio --split -o frag.img
 bootsmasher vboot broken.img fox.lz4 --pad-to 67108864 --min-free 1G -o fox_64m.img
 bootsmasher vboot broken.img > fixed.img
 
@@ -118,18 +195,28 @@ cargo build --release
 ## Структура
 
 ```text
-Cargo.toml            только lz4_flex (+ libc-биндинг statvfs на Unix); release: LTO fat, abort, strip
+Cargo.toml            lz4_flex + flate2 + lzma-rust2 + serde/toml (+ libc-биндинг statvfs на Unix);
+                      release: LTO fat, abort, strip
 build.sh              статическая мультиарх-сборка (linux musl x4 + windows gnu x2)
-src/main.rs           диспетчер подпрограмм (в 0.1.0 только vboot)
+src/main.rs           диспетчер подпрограмм (vboot | unpack | repack)
 src/error.rs          один тип ошибок, диагностика только в stderr
+src/bootimg.rs        парсинг/сборка ANDROID! v0..v4, отщепление kernel_dtb
+src/codec.rs          sniff + транскодинг gzip/xz/lzma/lz4-frame/lz4-legacy
+src/cpiox.rs          распаковка cpio в каталог (безопасные пути, симлинки, права)
+src/spec.rs           запись раскладки spec.toml (serde/toml, hex board_id)
+src/unpack.rs         подпрограмма unpack (boot + vendor, diagnose, rescue)
+src/repack.rs         подпрограмма repack (spec/base/template/set/format/footer)
 src/vboot/mod.rs      CLI vboot (позиционные + -o/--out/--pad-to/--verify/--split-first-stage/--merge/--min-free/--check-dir)
 src/vboot/image.rs    структуры заголовка vendor_boot v3/v4 и таблицы
 src/vboot/lz4legacy.rs  marker-free фрейминг LZ4-legacy поверх блочного кодека lz4_flex
 src/vboot/cpio.rs     парсинг/сборка/разбиение newc (lib/** = dlkm, recovery|debug_ramdisk/** = recovery), терпим к 512-падам
 src/vboot/dtb.rs      проходчик склеенных FDT
-src/vboot/ops.rs      анализатор + перепаковка (Keep/Split/Merge) + предэмиссионный верифаер
+src/vboot/ops.rs      анализатор + перепаковка (Keep/Split/Merge) + предэмиссионный верифаер + диагноз для unpack
 src/vboot/space.rs    парсинг размеров + проверка места перед записью (statvfs / GetDiskFreeSpaceExW)
-test_vboot.sh         функциональные тесты (20 проверок), хелпер test_compare_dlkm.py
+test_vboot.sh         сьюта vboot (20 проверок), хелпер test_compare_dlkm.py
+test_unpack_repack.sh сьюта unpack/repack (16 проверок: GKI boot, init_boot,
+                      recovery vendor_boot, roundtrip-ы, -n идентичность, base
+                      fallback, set/format, refuse-invalid, template, место)
 ```
 
 ## Лицензия

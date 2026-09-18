@@ -1,10 +1,87 @@
 # bootsmasher
+Standalone static CLI for Android boot-image surgery. Three subprograms
+(short aliases in brackets):
 
-Standalone static CLI for Android boot-image surgery. Subprogram `vboot` (v0.1.0)
-analyzes and repacks `vendor_boot` v3/v4 images, specialized for Pixel 6
-(gs101, page size 2048). 100% self-contained: pure Rust (`lz4_flex` only),
-no external commands, no C dependencies; static musl builds for Linux
-(x86_64/x86/aarch64/armv7) and MinGW builds for Windows (x86_64/aarch64).
+- `vboot` [`vb`] — smart `vendor_boot` repair flow (Pixel 6 specialization):
+  stale-table normalize, platform replace, `--split-first-stage`
+  (`--split`) / `--merge` partition modes, pre-emit verify, stdout mode,
+  `--min-free` space gate.
+- `unpack` [`u`|`up`] — magiskboot-compatible extraction for `boot.img`
+  (v0..v4, kernels, dtb/dtbo) **and** `vendor_boot`, with
+  auto-decompression, per-section verdicts and never-die reporting.
+- `repack` [`r`|`rp`] — rebuild from an unpack dir: `spec.toml` or
+  `--base` (`-b`), `--template` (`-t`), `--set` (`-s`), `--format` (`-f`),
+  footer control, pre-write verify.
+
+`bootsmasher help [subprogram]` prints a subprogram manual; every
+subprogram also answers `--help`. Exit codes everywhere: 0 ok, 1 usage
+error, 2 broken input / failed verification.
+
+100% self-contained: pure Rust (`lz4_flex`, `flate2`, `lzma-rust2`,
+`serde`/`toml`; `libc` statvfs binding on Unix only), no external
+commands, no C code; static musl builds for Linux (x86_64/x86/aarch64/
+armv7) and MinGW/LLVM builds for Windows (x86_64/aarch64).
+
+## unpack (`u`, `up`)
+
+```text
+bootsmasher unpack <image> [-h] [-n] [-o <dir>] [-x] [--no-spec]
+```
+
+Auto-detects `ANDROID!` vs `VNDRBOOT`, dumps magiskboot-compatible names
+(`kernel`, `kernel_dtb`, `ramdisk.cpio`, `second`, `extra`,
+`recovery_dtbo`, `dtb`, `signature`, `bootconfig`, `header`, plus
+`vendor_ramdisk/<name>.cpio`, `footer.bin` and our `spec.toml`):
+
+- `-h` writes the magiskboot `header` file (name/cmdline/os_version);
+  `spec.toml` is always written too (full fidelity: formats, sizes,
+  board_id, footer) unless `--no-spec`.
+- Default decompresses kernel/ramdisk/extra on the fly (gzip/xz/lzma/
+  lz4-frame/lz4-legacy sniffed by magic); `-n` keeps original bytes.
+- A fragment that fails to decompress is still dumped RAW and flagged
+  `INVALID` — the run never aborts like magiskboot does.
+- `--extract` expands every usable cpio into `<file>.d/` (files, dirs,
+  symlinks, unix modes).
+- Broken images get a per-section WHY (`block 6 truncated: need X, have
+  Y — table slices one stream mid-block; table sum vs header, diff N`)
+  and, for stale-table vendor_boot, a
+  `vendor_ramdisk/ramdisk.full-rescue.cpio` with the whole blob as one
+  valid stream. Final line `RESULT: OK` (exit 0) or `RESULT: DEGRADED`
+  (exit 0; exit 2 only when even the header is unreadable).
+
+## repack (`r`, `rp`)
+
+```text
+bootsmasher repack [dir="."] [out="new-boot.img"] [-b <img>] [-t <img>]
+                   [-s k=v]... [-f target=fmt]... [-n] [--drop-footer]
+                   [--pad-to N] [--min-free S] [--check-dir <dir>]
+```
+
+- Layout from `dir/spec.toml`; without it `--base` supplies sizes,
+  formats and missing-file bytes (magiskboot parity: only present files
+  replace components). Without both, the layout is unknown (exit 1).
+- Header scalars: spec/base → `dir/header` (magiskboot parity) →
+  `--template` → `--set` (`cmdline|name|os_version|os_patch_level|
+  page_size|kernel_addr|ramdisk_addr|second_addr|tags_addr|dtb_addr`).
+- Formats per section (`--format ramdisk.cpio=gzip`, groups `ramdisk`/
+  `all`), defaulting to spec/base/detected; v4 boot ramdisk is forced to
+  `lz4_legacy` (GKI merge rule, like magiskboot); already-compressed
+  files pass through verbatim; `-n` skips compression.
+- Vendor table rebuilt (offsets rechained, names/types/board_id kept);
+  boot `recovery_dtbo` offset refreshed; `kernel_dtb` honored with an
+  explicit kernel file.
+- Footer kept (`footer.bin`, else base trailing bytes) unless
+  `--drop-footer`. Output re-parsed and re-verified in memory; on
+  failure nothing is written. Space gate: output dir must fit image +
+  `--min-free` (bytes or `512M`).
+
+```sh
+bootsmasher unpack vendor_boot.img -o dir -h -x
+bootsmasher u boot.img -o dir -n
+bootsmasher repack dir fixed.img
+bootsmasher r dir fox.img -b stock.img -f ramdisk.cpio=gzip
+bootsmasher repack pinit/ init_new.img -s cmdline="console=ttyS0" -n
+```
 
 ## Why
 
@@ -17,7 +94,7 @@ fails with `failed to fill whole buffer`. `bootsmasher vboot` detects exactly
 this instead of guessing: every fragment is decompressed and its cpio is
 verified, the table sum is checked against the header, and FDTs are walked.
 
-## Usage
+## Usage (`vb`)
 
 ```text
 bootsmasher vboot <vboot.img> [platform.cpio|platform.cpio.lz4] [out.img]
@@ -68,12 +145,10 @@ treats a zero word as corruption, so no end marker is written).
 
 ```sh
 bootsmasher vboot --verify vendor_boot.img
-bootsmasher vboot broken_vendor_boot.img -o fixed.img
+bootsmasher vb broken_vendor_boot.img -o fixed.img
 bootsmasher vboot stock_vendor_boot.img OrangeFox.ramdisk.lz4 -o fox_boot.img
 bootsmasher vboot stock_vendor_boot.img --merge -o single.img
-bootsmasher vboot broken.img full.cpio --split-first-stage -o frag.img
-bootsmasher vboot broken.img fox.lz4 --pad-to 67108864 --min-free 1G -o fox_64m.img
-bootsmasher vboot broken.img > fixed.img
+bootsmasher vboot broken.img full.cpio --split -o frag.img
 bootsmasher vboot broken.img fox.lz4 --pad-to 67108864 --min-free 1G -o fox_64m.img
 bootsmasher vboot broken.img > fixed.img
 ```
@@ -120,18 +195,28 @@ verdicts, byte-identical round-trips, verbatim dlkm keep, stdout purity,
 ## Layout
 
 ```text
-Cargo.toml            lz4_flex only (+ libc statvfs binding on Unix); release: LTO fat, abort, strip
+Cargo.toml            lz4_flex + flate2 + lzma-rust2 + serde/toml (+ libc statvfs on Unix);
+                      release: LTO fat, abort, strip
 build.sh              static multi-arch builder (linux musl x4 + windows gnu x2)
-src/main.rs           subprogram dispatch (vboot in 0.1.0)
+src/main.rs           subprogram dispatch (vboot | unpack | repack)
 src/error.rs          single error type, stderr-only diagnostics
+src/bootimg.rs        ANDROID! v0..v4 parse/serialize, kernel_dtb split
+src/codec.rs          gzip/xz/lzma/lz4-frame/lz4-legacy sniff + transcode
+src/cpiox.rs          cpio-to-directory extraction (safe paths, symlinks, modes)
+src/spec.rs           spec.toml layout record (serde/toml, hex board_id)
+src/unpack.rs         unpack subprogram (boot + vendor, diagnose, rescue)
+src/repack.rs         repack subprogram (spec/base/template/set/format/footer)
 src/vboot/mod.rs      vboot CLI (positional + -o/--out/--pad-to/--verify/--split-first-stage/--merge/--min-free/--check-dir)
-src/vboot/image.rs    vendor_boot v3/v4 header + ramdisk table structs
+src/vboot/image.rs    structures of the vendor_boot v3/v4 header and table
 src/vboot/lz4legacy.rs  marker-free LZ4-legacy framing over lz4_flex block codec
 src/vboot/cpio.rs     newc parse/build/partition (lib/** = dlkm, recovery|debug_ramdisk/** = recovery), 512-pad tolerant
 src/vboot/dtb.rs      concatenated-FDT walker
-src/vboot/ops.rs      analyzer + repack (Keep/Split/Merge) + pre-emit verifier
+src/vboot/ops.rs      analyzer + repack (Keep/Split/Merge) + pre-emit verifier + unpack diagnosis
 src/vboot/space.rs    size parsing + pre-write free-space check (statvfs / GetDiskFreeSpaceExW)
-test_vboot.sh         functional suite (20 checks), test_compare_dlkm.py helper
+test_vboot.sh         vboot suite (20 checks), test_compare_dlkm.py helper
+test_unpack_repack.sh unpack/repack suite (16 checks: GKI boot, init_boot,
+                      recovery vendor_boot, roundtrips, -n identity, base
+                      fallback, set/format, refuse-invalid, template, space)
 ```
 
 ## License

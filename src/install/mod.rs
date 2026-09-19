@@ -588,8 +588,19 @@ fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)],
     true
 }
 
-/// [1/5] device: pick, then bring to the bootloader. False = exit 1.
-fn stage_device(ctx: &mut Ctx) -> bool {
+/// [1/5] device outcome: Ok = in bootloader, Abort = user walked
+/// away (exit 0, nothing flashed), Fail = no device / reboot failed
+/// (exit 1). Matches the reference script where abort_user always
+/// exits 0.
+#[derive(PartialEq)]
+enum DevStage {
+    Ok,
+    Abort,
+    Fail,
+}
+
+/// [1/5] device: pick, then bring to the bootloader.
+fn stage_device(ctx: &mut Ctx) -> DevStage {
     ctx.step("[1/5] device");
     let fb_devs = fb::serials(&ctx.cfg.tools.fastboot, "fastboot", &mut ctx.log);
     let adb_devs = fb::serials(&ctx.cfg.tools.adb, "device", &mut ctx.log);
@@ -613,7 +624,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
             }
             _ => {
                 ctx.say("  aborted by user, nothing flashed");
-                return false;
+                return DevStage::Abort;
             }
         }
     } else if fb_devs.len() == 1 {
@@ -635,7 +646,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
             }
             _ => {
                 ctx.say("  aborted by user, nothing flashed");
-                return false;
+                return DevStage::Abort;
             }
         }
     } else if adb_devs.len() == 1 {
@@ -644,7 +655,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
         ctx.say(&format!("  {} via adb", tag(&serial, label)));
     } else if ctx.force {
         ctx.say("  no device in fastboot or adb mode");
-        return false;
+        return DevStage::Fail;
     } else {
         ctx.say("  no device detected.");
         ctx.say("  Reboot it to the bootloader manually (VolDown+Power, or: adb reboot bootloader),");
@@ -652,7 +663,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
         match menu("Device ready?", 1, &opts).as_deref() {
             Ok(EXIT_ITEM) | Err(_) => {
                 ctx.say("  aborted by user, nothing flashed");
-                return false;
+                return DevStage::Abort;
             }
             _ => {}
         }
@@ -662,7 +673,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
                 ctx.say("  Still nothing. Press Enter to exit and retry.");
                 read_pause();
                 ctx.say("  aborted");
-                return false;
+                return DevStage::Abort;
             }
         }
     }
@@ -679,7 +690,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
             Some(s) => serial = s,
             None => {
                 ctx.say("  device did not come back to bootloader");
-                return false;
+                return DevStage::Fail;
             }
         }
     } else if in_fb {
@@ -693,20 +704,20 @@ fn stage_device(ctx: &mut Ctx) -> bool {
             Some(s) => serial = s,
             None => {
                 ctx.say("  device did not come back to bootloader");
-                return false;
+                return DevStage::Fail;
             }
         }
         ctx.say(&format!("  {serial} in bootloader"));
     } else {
         ctx.say(&format!("  {serial} not reachable over fastboot or adb"));
-        return false;
+        return DevStage::Fail;
     }
     ctx.serial = serial.clone();
     let product = fb::getvar(&ctx.cfg.tools.fastboot, &serial, "product", &mut ctx.log).unwrap_or_else(|| "?".to_string());
     let curslot = fb::getvar(&ctx.cfg.tools.fastboot, &serial, "current-slot", &mut ctx.log).unwrap_or_else(|| "?".to_string());
     ctx.say(&format!("  product={product} active slot={curslot} serial={serial}"));
     ctx.say(&format!("  log: {}", ctx.backup.join("install.log").display()));
-    true
+    DevStage::Ok
 }
 
 /// [3/5] fetch current stock into the run backup dir. False = exit 2.
@@ -1143,8 +1154,10 @@ pub fn run(args: &[String], prog: &str) -> i32 {
     };
 
     ctx.say("OrangeFox vendor_boot installer");
-    if !stage_device(&mut ctx) {
-        return 1;
+    match stage_device(&mut ctx) {
+        DevStage::Abort => return 0,
+        DevStage::Fail => return 1,
+        DevStage::Ok => {}
     }
 
     // --- [2/5] static plan: flags/force known upfront ---

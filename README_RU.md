@@ -1,10 +1,11 @@
 # bootsmasher
 
-Статичный самодостаточный CLI для хирургии Android boot-образов. Четыре подпрограммы (короткие алиасы в скобках):
+Статичный самодостаточный CLI для хирургии Android boot-образов. Шесть подпрограмм (короткие алиасы в скобках):
 
 - `vboot` [`vb`] — умный ремонтный флоу `vendor_boot` (специализация Pixel 6):
   нормализация протухшей таблицы, замена платформы,
-  `--split-first-stage` (`--split`) / `--merge`, предэмиссионная проверка, режим stdout,
+  `--split-first-stage` (`--split`) / `--merge`, фильтр фрагментов `--drop`,
+  правило first-stage inbuild-vs-cpio, предэмиссионная проверка, режим stdout,
   гейт места `--min-free`.
 - `unpack` [`u`|`up`] — извлечение в духе magiskboot для `boot.img` (v0..v4, ядра,
   dtb/dtbo) **и** `vendor_boot`: автодекомпрессия, вердикты по секциям,
@@ -14,6 +15,9 @@
   управление футером, проверка перед записью.
 - `cpio` [`c`] — правка newc-архива на месте, точный порт magiskboot:
   `exists/ls/rm/mkdir/ln/mv/add/extract/test/patch/backup/restore`.
+- `compress` [`cmp`] — сжать один файл именованным кодеком
+  (`compress[=format]`, по умолчанию gzip): gzip/xz/lzma/lz4/lz4_legacy.
+- `decompress` [`dcmp`] — распаковать один архив, формат по магии.
 
 `bootsmasher help [подпрограмма]` печатает мануал подпрограммы; каждая
 подпрограмма также отвечает на `--help`. Коды выхода везде: 0 ок, 1 ошибка
@@ -112,6 +116,40 @@ bootsmasher cpio ramdisk.cpio patch
 bootsmasher cpio ramdisk.cpio test; echo $?
 ```
 
+## compress / decompress (`cmp` / `dcmp`)
+
+```text
+bootsmasher compress[=format] <вход> [выход]
+bootsmasher decompress <вход> [выход]
+```
+
+Паритет magiskboot для однофайловых кодеков поверх `src/codec.rs`
+(gzip/xz/lzma/lz4-frame/lz4-legacy sniff + транскодинг, чистый Rust):
+
+- `compress` по умолчанию gzip; явно `compress=xz`, `compress=lzma`,
+  `compress=lz4`, `compress=lz4_legacy` (алиас `lz4_lg`). Неизвестный
+  формат — как у magiskboot:
+  `Unsupported or unknown compression format: ...` (exit 1).
+- `decompress` определяет формат по магии, печатает
+  `Detected format: <имя>` в stderr и распаковывает. Нет знакомой магии
+  (или чужое расширение архива) — `Input file is not a supported type!`
+  (exit 2).
+- `-` с любой стороны — бинарные stdin/stdout. Без `[выхода]` входной
+  файл заменяется: compress дописывает расширение формата
+  (`ramdisk.cpio` → `ramdisk.cpio.gz`; у lz4_legacy общий `.lz4` с lz4,
+  ровно как у magiskboot), decompress его снимает.
+- Единственное сознательное отклонение: **bzip2 не встроен** (сторонние
+  зависимости запрещены — только то, что уже в Cargo.toml).
+  `compress=bzip2` — usage-ошибка (`bzip2 not supported in this build`),
+  а `BZh`-блоб на `decompress` — ошибка `unsupported format` (exit 2).
+
+```sh
+bootsmasher compress ramdisk.cpio                  # -> ramdisk.cpio.gz
+bootsmasher compress=xz ramdisk.cpio ramdisk.cpio.xz
+bootsmasher decompress ramdisk.cpio.gz             # -> ramdisk.cpio
+cat ramdisk.cpio | bootsmasher compress - - | bootsmasher decompress - -
+```
+
 ## Зачем
 
 Кривой мейнтейнерский `vendor_boot` содержал один LZ4-legacy поток на весь
@@ -145,6 +183,20 @@ bootsmasher vboot --verify <vboot.img> [platform] [--check-dir <каталог>]
 - `--merge` — склеить всё в один фрагмент platform (слоты platform
   заменяются новым файлом, если дан; исходное содержимое dlkm/recovery
   присоединяется; серединные TRAILERы выкидываются, пишется ровно один).
+- `--drop <sel,...>` — удалить исходные фрагменты по типу или имени из
+  таблицы (`platform`, `dlkm`, `recovery`, `none`, `16K`, ...; повторяется,
+  через запятую, регистр важен), во всех режимах: Keep пропускает их
+  (выжившие смыкают offsets), Split/Merge исключают их из пула, carryover
+  и дословного dlkm-фолбэка. Селектор, ничего не нашедший, предупреждает
+  в stderr и игнорируется. `first-stage` — особый, см. ниже.
+
+Правило first-stage (с файлом платформы): собственный
+`first_stage_ramdisk/**` базового образа (inbuild) сохраняется по
+умолчанию — эти записи идут первыми, first-stage-записи переданного cpio
+удаляются попутно. Добавь `first-stage` в `--drop`, чтобы инвертировать
+правило (победит first-stage из cpio, inbuild удалится). Без файла
+платформы `--drop first-stage` вычищает `first_stage_ramdisk/**` из пула
+записей. Корневой `init` — обычный platform-пейлоад, не first-stage.
 
 Перекодированные фрагменты — marker-free LZ4-legacy, ровно как
 kernel-рамдиски (фрагменты стыкуются впритык; `lz4` CLI считает нулевое слово
@@ -178,6 +230,9 @@ bootsmasher vboot --verify vendor_boot.img
 bootsmasher vboot broken_vendor_boot.img -o fixed.img
 bootsmasher vboot stock_vendor_boot.img OrangeFox.ramdisk.lz4 -o fox_boot.img
 bootsmasher vboot stock_vendor_boot.img --merge -o single.img
+bootsmasher vboot shiba_vendor_boot.img fox.cpio --drop 16K -o fox_shiba.img
+bootsmasher vboot shiba_vendor_boot.img fox.cpio --drop 16K,first-stage -o fox2.img
+bootsmasher vboot laguna_vendor_boot.img --drop recovery -o plat_only.img
 bootsmasher vboot broken.img full.cpio --split -o frag.img
 bootsmasher vboot broken.img fox.lz4 --pad-to 67108864 --min-free 1G -o fox_64m.img
 bootsmasher vboot broken.img > fixed.img
@@ -227,16 +282,17 @@ cargo build --release
 Cargo.toml            lz4_flex + flate2 + lzma-rust2 + serde/toml (+ libc-биндинг statvfs на Unix);
                       release: LTO fat, abort, strip
 build.sh              статическая мультиарх-сборка (linux musl x4 + windows gnu x2)
-src/main.rs           диспетчер подпрограмм (vboot | unpack | repack | cpio)
+src/main.rs           диспетчер подпрограмм (vboot | unpack | repack | cpio | compress | decompress)
 src/error.rs          типы ошибок (Usage/Fail/Io/Parse/Verify), диагностика только в stderr
 src/bootimg.rs        парсинг/сборка ANDROID! v0..v4, отщепление kernel_dtb
 src/codec.rs          sniff + транскодинг gzip/xz/lzma/lz4-frame/lz4-legacy
+src/compress_cmd.rs   подпрограммы compress[=fmt]/decompress (паритет magiskboot, bzip2 отклонён)
 src/cpiox.rs          распаковка cpio в каталог (безопасные пути, симлинки, права)
 src/cpio_cmd.rs       подпрограмма cpio (порт magiskboot: 12 команд на месте)
 src/spec.rs           запись раскладки spec.toml (serde/toml, hex board_id)
 src/unpack.rs         подпрограмма unpack (boot + vendor, diagnose, rescue)
 src/repack.rs         подпрограмма repack (spec/base/template/set/format/footer)
-src/vboot/mod.rs      CLI vboot (позиционные + -o/--out/--pad-to/--verify/--split-first-stage/--merge/--min-free/--check-dir)
+src/vboot/mod.rs      CLI vboot (позиционные + -o/--out/--pad-to/--verify/--split-first-stage/--merge/--drop/--min-free/--check-dir)
 src/vboot/image.rs    структуры заголовка vendor_boot v3/v4 и таблицы
 src/vboot/lz4legacy.rs  marker-free фрейминг LZ4-legacy поверх блочного кодека lz4_flex
 src/vboot/cpio.rs     парсинг/сборка/разбиение newc (lib/** = dlkm, recovery|debug_ramdisk/** = recovery), терпим к 512-падам
@@ -244,10 +300,11 @@ src/vboot/dtb.rs      проходчик склеенных FDT
 src/vboot/ops.rs      анализатор + перепаковка (Keep/Split/Merge) + предэмиссионный верифаер + диагноз для unpack
 src/vboot/space.rs    парсинг размеров + проверка места перед записью (statvfs / GetDiskFreeSpaceExW)
 test_vboot.sh         сьюта vboot (21 проверка, вкл. carryover 16K), хелпер test_compare_dlkm.py
-test_unpack_repack.sh сьюта unpack/repack/cpio (30 проверок: GKI boot, init_boot,
+test_unpack_repack.sh сьюта unpack/repack/cpio/compress (35 проверок: GKI boot, init_boot,
                       recovery vendor_boot, roundtrip-ы, -n идентичность, base
                       fallback, set/format, refuse-invalid, template, место,
-                      edit-wins, алиасы, cpio patch/backup/restore)
+                      edit-wins, алиасы, cpio patch/backup/restore,
+                      compress/decompress roundtrip-ы + дефолт + pipe + плохой формат)
 ```
 
 ## Лицензия

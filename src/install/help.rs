@@ -29,7 +29,7 @@ export.txt next to the binary, then ./export.txt.
 Usage:
   {prog} install [--force] [--slot a|b|both] [--mode install|restore]
                  [--backup latest|STAMP] [--export FILE]
-  {prog} install --file -i INPUT -c CPIOPAYLOAD -o OUTPUT
+  {prog} install --file -i INPUT -c CPIOPAYLOAD -o OUTPUT [--log FILE]
                  (recovery install into a plain image file: verify input,
                  rebuild with the payload, verify output, write; no
                  device, no backup, no menus; built for recovery use)
@@ -77,8 +77,8 @@ File mode (--file) needs no export.txt, no device and no terminal:
 the input image is verified, rebuilt with the cpio payload (vbmeta
 footer dropped, same recovery-install layout as the device flow),
 the result is verified again and only then written. Input and output
-must not be the same file. Verdict details go to stderr, short
-status lines to stdout.
+must not be the same file. Short status lines go to stdout, verdict
+details to stderr; --log FILE additionally tees both into the file.
 
 Exit codes: 0 ok (or clean user abort, nothing flashed),
 1 usage / no device, 2 build/verify/flash failure."

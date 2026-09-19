@@ -39,10 +39,11 @@ struct Cli {
     input: String,
     cpio: String,
     output: String,
+    log: String,
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new() };
+    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new(), log: String::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -83,6 +84,11 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 c.output = args.get(i).ok_or("-o needs an output path".to_string())?.clone();
             }
             s if s.starts_with("--output=") => c.output = s["--output=".len()..].to_string(),
+            "--log" => {
+                i += 1;
+                c.log = args.get(i).ok_or("--log needs a file".to_string())?.clone();
+            }
+            s if s.starts_with("--log=") => c.log = s["--log=".len()..].to_string(),
             other => return Err(format!("unknown arg: {other}")),
         }
         i += 1;
@@ -95,6 +101,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
             return Err("--file needs -i INPUT -c CPIOPAYLOAD -o OUTPUT".to_string());
         }
         return Ok(c);
+    }
+    if !c.log.is_empty() {
+        return Err("--log needs --file".to_string());
     }
     if !c.input.is_empty() || !c.cpio.is_empty() || !c.output.is_empty() {
         return Err("-i/-c/-o need --file".to_string());
@@ -944,9 +953,41 @@ fn stage_flash(ctx: &mut Ctx) -> bool {
 /// device, no backup, no menus (built for recovery use).
 /// Verify input -> rebuild with the cpio payload (footer dropped,
 /// same layout as the device flow) -> verify output -> write.
+/// Short status lines go to stdout, verdict details to stderr; with
+/// --log FILE both streams are additionally tee'd into the file.
 /// Exit codes: 0 ok, 1 usage, 2 verify/build failure.
 fn run_file(cli: &Cli) -> i32 {
-    println!("OrangeFox file install");
+    // Optional tee log (--log FILE); console behavior never changes.
+    let mut log: Option<File> = None;
+    if !cli.log.is_empty() {
+        match File::create(&cli.log) {
+            Ok(f) => log = Some(f),
+            Err(e) => {
+                println!("  FAIL: cannot create log file: {e}");
+                return 2;
+            }
+        }
+    }
+    // Status line: stdout + log. Detail: stderr + log.
+    macro_rules! say {
+        ($($t:tt)*) => {{
+            let line = format!($($t)*);
+            println!("{line}");
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+        }};
+    }
+    macro_rules! detail {
+        ($t:expr) => {{
+            let text: String = $t;
+            eprintln!("{text}");
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{text}");
+            }
+        }};
+    }
+    say!("OrangeFox file install");
     let same = std::path::absolute(&cli.input).ok() == std::path::absolute(&cli.output).ok();
     if same {
         eprintln!("usage error: input and output are the same file");
@@ -955,61 +996,61 @@ fn run_file(cli: &Cli) -> i32 {
     let img = match std::fs::read(&cli.input) {
         Ok(b) => b,
         Err(e) => {
-            println!("  FAIL: cannot read input: {e}");
+            say!("  FAIL: cannot read input: {e}");
             return 2;
         }
     };
     let payload = match std::fs::read(&cli.cpio) {
         Ok(b) => b,
         Err(e) => {
-            println!("  FAIL: cannot read cpio payload: {e}");
+            say!("  FAIL: cannot read cpio payload: {e}");
             return 2;
         }
     };
     match verdict_text(&img, "input") {
         Ok(t) => {
-            eprintln!("{t}");
+            detail!(t);
             match ops::analyze(&img) {
-                Ok(a) => println!("  ok: input valid ({} fragments, ramdisk {})", a.frags.len(), mb(a.header_ramdisk_size as u64)),
+                Ok(a) => say!("  ok: input valid ({} fragments, ramdisk {})", a.frags.len(), mb(a.header_ramdisk_size as u64)),
                 Err(e) => {
-                    println!("  FAIL: input unreadable: {e}");
+                    say!("  FAIL: input unreadable: {e}");
                     return 2;
                 }
             }
         }
         Err(t) => {
-            eprintln!("{t}");
-            println!("  FAIL: input image INVALID, nothing written");
+            detail!(t);
+            say!("  FAIL: input image INVALID, nothing written");
             return 2;
         }
     }
     let label = Path::new(&cli.cpio).file_name().and_then(|n| n.to_str()).unwrap_or("payload").to_string();
-    println!("  rebuild ({label}, footer dropped)");
+    say!("  rebuild ({label}, footer dropped)");
     let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((label, payload)), drop_footer: true };
     let _quiet = QuietGuard::on();
     let out = match ops::repack_with_opts(&img, None, opts) {
         Ok(o) => o,
         Err(e) => {
-            println!("  FAIL: rebuild failed, nothing written: {e}");
+            say!("  FAIL: rebuild failed, nothing written: {e}");
             return 2;
         }
     };
     match verdict_text(&out, "output") {
-        Ok(t) => eprintln!("{t}"),
+        Ok(t) => detail!(t),
         Err(t) => {
-            eprintln!("{t}");
-            println!("  FAIL: rebuilt image INVALID, nothing written");
+            detail!(t);
+            say!("  FAIL: rebuilt image INVALID, nothing written");
             return 2;
         }
     }
     match std::fs::write(&cli.output, &out) {
-        Ok(()) => println!("  ok: wrote {} ({})", cli.output, mb(out.len() as u64)),
+        Ok(()) => say!("  ok: wrote {} ({})", cli.output, mb(out.len() as u64)),
         Err(e) => {
-            println!("  FAIL: cannot write output: {e}");
+            say!("  FAIL: cannot write output: {e}");
             return 2;
         }
     }
-    println!("RESULT: OK");
+    say!("RESULT: OK");
     0
 }
 

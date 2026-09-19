@@ -130,7 +130,10 @@ if [[ "$BUILDER" == "cargo" ]]; then
 fi
 
 setup_linkers() {
-    [[ "$BUILDER" != "cargo" ]] && return 0
+    # cross drives its own linkers via container images, except
+    # winarm64: cross has no image for it and falls back to host
+    # cargo, which needs the llvm-mingw linker from the environment.
+    if [[ "$BUILDER" != "cargo" && "$1" != "$WIN_ARM64" ]]; then return 0; fi
     case "$1" in
         "$LINUX_ARM64") export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="aarch64-linux-gnu-gcc" ;;
         "$LINUX_ARM32") export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER="arm-linux-gnueabihf-gcc" ;;

@@ -6,8 +6,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::error::{Error, Result};
-use crate::vboot::cpio::{self, name_str};
+use crate::common::error::{Error, Result};
+use crate::common::cpio::{self, name_str};
 
 #[derive(Debug, Default)]
 pub struct ExtractReport {

@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 /// Parse `67108864`, `512M`, `1GiB`, `1.5G` (case-insensitive, optional
 /// trailing B, K/M/G/T are binary: 1K = 1024).

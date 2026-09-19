@@ -4,8 +4,8 @@
 //! gzip, xz, lzma-alone, lz4-frame, lz4-legacy. Everything else is `Raw`
 //! and passes through untouched. Pure Rust on every target.
 
-use crate::error::{Error, Result};
-use crate::vboot::lz4legacy;
+use crate::common::error::{Error, Result};
+use crate::common::lz4legacy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {

@@ -5,7 +5,7 @@
 //! `d0 0d fe ed` and declares its own `totalsize`; the next FDT
 //! starts exactly at `offset + totalsize` — no page padding between them.
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 const FDT_MAGIC: [u8; 4] = [0xD0, 0x0D, 0xFE, 0xED];
 

@@ -1,55 +1,22 @@
 //! bootsmasher — standalone static Android boot-image smasher.
-//! Subprograms: `vboot` (Pixel 6 vendor_boot repair flow), `unpack`
-//! (magiskboot-compatible extraction for boot + vendor_boot), `repack`
-//! (rebuild from an unpack dir, spec, base or template image).
-//! Every subprogram has short aliases (vb, u/up, r/rp) and --help.
+//!
+//! Subprograms, each in its own directory: `vboot` (vendor_boot repair
+//! flow), `unpack` (extraction for boot + vendor_boot), `repack`
+//! (rebuild from an unpack dir), `cpio` (in-place newc surgery),
+//! `compress[=fmt]` + `decompress` (single-file codecs). Shared building
+//! blocks live in `common`; the global help lives in `help`, per-subprogram
+//! texts in `<sub>/help.rs`. Every help prints the argv[0] basename, so a
+//! renamed binary documents itself correctly.
 
-mod error;
+mod common;
+mod help;
 mod vboot;
-mod bootimg;
-mod codec;
-mod cpiox;
-mod cpio_cmd;
-mod spec;
 mod unpack;
 mod repack;
+mod cpio;
+mod compress;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const GLOBAL_HELP: &str = "bootsmasher — standalone static Android boot-image surgery.
-
-Subprograms (short aliases in brackets):
-  vboot [vb]     Smart vendor_boot repair flow (Pixel 6 / gs101):
-                 stale-table normalize, platform replace,
-                 --split-first-stage / --merge partition modes,
-                 pre-emit verify, stdout mode, --min-free space gate.
-  unpack [u|up]  Extract boot.img (v0..v4, kernels, dtb/dtbo) and
-                 vendor_boot with auto-decompression and honest
-                 per-section verdicts (broken parts are dumped anyway,
-                 with the exact WHY — never dies like magiskboot).
-  repack [r|rp]  Rebuild boot/vendor_boot from an unpack dir:
-                 spec.toml or --base layout, --template foreign headers,
-                 --set overrides, --format transcoding, footer control,
-                 in-memory re-verify before writing.
-  cpio [c]       In-place newc archive surgery (magiskboot port):
-                 exists/ls/rm/mkdir/ln/mv/add/extract/test/patch/
-                 backup/restore on raw 070701 cpio files.
-
-Usage:
-  bootsmasher <subprogram> [args...]
-  bootsmasher <subprogram> --help     Full manual for one subprogram.
-  bootsmasher help [subprogram]       Same as above.
-  bootsmasher --version
-
-Examples:
-  bootsmasher unpack vendor_boot.img --out-dir dir -h --extract
-  bootsmasher repack dir fixed.img --base stock.img
-  bootsmasher vboot broken.img fox.lz4 -o fox_boot.img
-  bootsmasher u boot.img -o dir -x
-  bootsmasher cpio ramdisk.cpio \"exists init\" \"ls -r /system\"
-
-Exit codes everywhere: 0 ok (unpack: possibly DEGRADED, see report),
-1 usage error, 2 broken input / failed verification.";
 
 fn say(line: &str) {
     use std::io::Write as _;
@@ -58,62 +25,136 @@ fn say(line: &str) {
     let _ = o.flush();
 }
 
-/// Canonical subprogram name or None. Short aliases:
-/// vb=vboot, u/up=unpack, r/rp=repack, c=cpio.
-fn canonical(name: &str) -> Option<&'static str> {
-    match name {
-        "vboot" | "vb" => Some("vboot"),
-        "unpack" | "u" | "up" => Some("unpack"),
-        "repack" | "r" | "rp" => Some("repack"),
-        "cpio" | "c" => Some("cpio"),
-        _ => None,
-    }
+/// Binary basename (`/usr/bin/bootsmasher` -> `bootsmasher`): this is the
+/// `{prog}` every help text prints.
+fn prog_name(argv0: &str) -> &str {
+    argv0.rsplit(['/', '\\']).next().unwrap_or(argv0)
+}
+
+/// Print the manual for one subprogram (short or expand flavor).
+/// Returns None for an unknown name.
+fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
+    let text = match name {
+        "vboot" => {
+            if expand {
+                vboot::help::expand(prog)
+            } else {
+                vboot::help::short(prog)
+            }
+        }
+        "unpack" => {
+            if expand {
+                unpack::help::expand(prog)
+            } else {
+                unpack::help::short(prog)
+            }
+        }
+        "repack" => {
+            if expand {
+                repack::help::expand(prog)
+            } else {
+                repack::help::short(prog)
+            }
+        }
+        "cpio" => {
+            if expand {
+                cpio::help::expand(prog)
+            } else {
+                cpio::help::short(prog)
+            }
+        }
+        "compress" => {
+            if expand {
+                compress::help::expand_compress(prog)
+            } else {
+                compress::help::short_compress(prog)
+            }
+        }
+        "decompress" => {
+            if expand {
+                compress::help::expand_decompress(prog)
+            } else {
+                compress::help::short_decompress(prog)
+            }
+        }
+        _ => return None,
+    };
+    say(&text);
+    Some(0)
 }
 
 fn main() -> std::process::ExitCode {
     let argv: Vec<String> = std::env::args().collect();
-    let program = argv.first().map(|s| s.as_str()).unwrap_or("bootsmasher");
+    let prog = prog_name(argv.first().map(|s| s.as_str()).unwrap_or("bootsmasher")).to_string();
     let args = if argv.len() > 1 { &argv[1..] } else { &[][..] };
     if args.is_empty() {
-        eprintln!("bootsmasher {VERSION}\n\n{GLOBAL_HELP}\n\n(run '{program} --help' for this text)");
+        eprintln!("{} {}\n\n{}\n\n(run '{prog} --help' for this text)", prog, VERSION, help::short(&prog));
         return std::process::ExitCode::from(1);
     }
     match args[0].as_str() {
         "-V" | "--version" => {
-            say(&format!("bootsmasher {VERSION}"));
+            say(&format!("{prog} {VERSION}"));
             std::process::ExitCode::from(0)
         }
         "-h" | "--help" => {
-            say(&format!("bootsmasher {VERSION}\n\n{GLOBAL_HELP}"));
+            say(&format!("{prog} {VERSION}\n\n{}", help::short(&prog)));
+            std::process::ExitCode::from(0)
+        }
+        "--expand" => {
+            say(&format!("{prog} {VERSION}\n\n{}", help::expand(&prog)));
             std::process::ExitCode::from(0)
         }
         "help" => {
-            // bootsmasher help [subprogram] — route to the sub manual.
-            if args.len() > 1 {
-                match canonical(&args[1]) {
-                    Some("vboot") => std::process::ExitCode::from(vboot::run(&["--help".to_string()]) as u8),
-                    Some("unpack") => std::process::ExitCode::from(unpack::run(&["--help".to_string()]) as u8),
-                    Some("repack") => std::process::ExitCode::from(repack::run(&["--help".to_string()]) as u8),
-                    Some("cpio") => std::process::ExitCode::from(cpio_cmd::run(&["--help".to_string()]) as u8),
-                    _ => {
-                        eprintln!("unknown subprogram '{}' (want vboot|unpack|repack|cpio)", args[1]);
+            // help [expand] [subprogram]
+            let rest: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
+            match rest.as_slice() {
+                [] => {
+                    say(&format!("{prog} {VERSION}\n\n{}", help::short(&prog)));
+                    std::process::ExitCode::from(0)
+                }
+                ["expand"] => {
+                    say(&format!("{prog} {VERSION}\n\n{}", help::expand(&prog)));
+                    std::process::ExitCode::from(0)
+                }
+                ["expand", sub] => match sub_help(sub, &prog, true) {
+                    Some(code) => std::process::ExitCode::from(code as u8),
+                    None => {
+                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress)");
                         std::process::ExitCode::from(1)
                     }
+                },
+                [sub] => match sub_help(sub, &prog, false) {
+                    Some(code) => std::process::ExitCode::from(code as u8),
+                    None => {
+                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress)");
+                        std::process::ExitCode::from(1)
+                    }
+                },
+                _ => {
+                    eprintln!("usage error: too many arguments (want 'help [expand] [subprogram]')");
+                    std::process::ExitCode::from(1)
                 }
-            } else {
-                say(&format!("bootsmasher {VERSION}\n\n{GLOBAL_HELP}"));
-                std::process::ExitCode::from(0)
             }
         }
-        other => match canonical(other) {
-            Some("vboot") => std::process::ExitCode::from(vboot::run(&args[1..]) as u8),
-            Some("unpack") => std::process::ExitCode::from(unpack::run(&args[1..]) as u8),
-            Some("repack") => std::process::ExitCode::from(repack::run(&args[1..]) as u8),
-            Some("cpio") => std::process::ExitCode::from(cpio_cmd::run(&args[1..]) as u8),
-            _ => {
-                eprintln!("unknown subprogram '{other}' (want vboot|vb|unpack|u|up|repack|r|rp|cpio|c)");
-                std::process::ExitCode::from(1)
+        other if other == "compress" || other.starts_with("compress=") => {
+            // The format is embedded in the command name itself.
+            let fmt_str = other.strip_prefix("compress=").unwrap_or("gzip");
+            match compress::parse_method(fmt_str) {
+                Ok(fmt) => std::process::ExitCode::from(compress::run_compress(fmt, &args[1..], &prog) as u8),
+                Err(e) => {
+                    eprintln!("usage error: {e}");
+                    std::process::ExitCode::from(1)
+                }
             }
-        },
+        }
+        "vboot" => std::process::ExitCode::from(vboot::run(&args[1..], &prog) as u8),
+        "unpack" => std::process::ExitCode::from(unpack::run(&args[1..], &prog) as u8),
+        "repack" => std::process::ExitCode::from(repack::run(&args[1..], &prog) as u8),
+        "cpio" => std::process::ExitCode::from(cpio::run(&args[1..], &prog) as u8),
+        "decompress" => std::process::ExitCode::from(compress::run_decompress(&args[1..], &prog) as u8),
+        other => {
+            eprintln!("unknown subprogram '{other}' (want vboot|unpack|repack|cpio|compress|decompress|compress=fmt)");
+            std::process::ExitCode::from(1)
+        }
     }
 }

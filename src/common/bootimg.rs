@@ -6,7 +6,7 @@
 //! PXA/Samsung oddities are refused with a clear message instead of
 //! guessing.
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 pub const BOOT_MAGIC: &[u8; 8] = b"ANDROID!";
 

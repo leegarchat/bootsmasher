@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {

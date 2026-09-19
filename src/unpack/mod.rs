@@ -6,101 +6,35 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bootimg;
-use crate::codec::{self, Format};
-use crate::cpiox;
-use crate::error::{Error, Result};
-use crate::spec;
-use crate::vboot::cpio;
-use crate::vboot::dtb;
-use crate::vboot::image::type_name;
+use crate::common::bootimg;
+use crate::common::codec::{self, Format};
+use crate::common::extract;
+use crate::common::error::{Error, Result};
+use crate::common::spec;
+use crate::common::cpio;
+use crate::common::dtb;
+use crate::common::vendor::type_name;
 use crate::vboot::ops;
 
-const HELP: &str = "bootsmasher unpack — extract boot/vendor_boot images (magiskboot superset)
-Aliases: u, up.
+pub(crate) mod help;
 
-Usage:
-  bootsmasher unpack <image> [-h] [-n] [-o <dir>] [-x] [--no-spec]
-  bootsmasher unpack --help
 
-What it does:
-  Detects ANDROID! (boot v0..v4) vs VNDRBOOT (vendor_boot v3/v4) by magic
-  and dumps every section as files with magiskboot-compatible names:
-    kernel | kernel_dtb | ramdisk.cpio | second | extra | recovery_dtbo |
-    dtb | signature | bootconfig | header (-h) | footer.bin | spec.toml
-  vendor_boot ramdisk fragments go to vendor_ramdisk/<name>.cpio
-  (the platform fragment is vendor_ramdisk/ramdisk.cpio), exactly like
-  magiskboot. Sections are read sequentially, each padded to the page
-  size (v0..v2/vendor page, fixed 4096 for boot v3/v4).
-
-Options:
-  -h               Write the magiskboot-compatible 'header' file
-                   (name, cmdline, os_version, os_patch_level — the only
-                   header keys magiskboot round-trips). NOTE: unlike
-                   magiskboot, -h here never means --help; use --help.
-                   Our lean spec.toml is always written too (only what
-                   repack reads: scalars, per-file formats/sizes,
-                   names/types/board_id; verdicts stay in the report).
-  -n               Keep components compressed in their original stored
-                   format (no decompression). Default: kernel, ramdisk
-                   and extra are decompressed on the fly; a fragment that
-                   fails to decompress is still dumped RAW (nothing is
-                   lost) and flagged INVALID in the report.
-  -o <dir>, --out-dir <dir>
-                   Destination directory (created if missing).
-                   Default: current directory, like magiskboot (existing
-                   files are overwritten, like magiskboot).
-  -x, --extract    Expand every usable cpio into <file>.d/ next to it
-                   (ramdisk.cpio -> ramdisk.d/, dlkm.cpio -> dlkm.d/):
-                   files, dirs, symlinks + unix permission bits restored.
-                   One-way inspection aid; repack works from the .cpio
-                   files, not from the .d/ trees. With -n the on-disk
-                   files stay raw, extraction still runs from memory
-                   whenever the bytes are decodable.
-  --no-spec        Skip spec.toml (magiskboot-parity mode: only the
-                   classic files are written).
-
-Detected formats (sniffed by magic, same order as magiskboot):
-  raw | gzip (1f 8b) | xz (fd 37 7a 58 5a 00) | lzma-alone (5d + pow2
-  dict) | lz4-frame (03/04 21/22 4c/4d 18) | lz4-legacy (02 21 4c 18).
-  Pixel kernels/ramdisks are usually lz4-legacy; GKI kernels ship as
-  lz4-legacy Image.lz4 blobs.
-
-Reporting (stdout; diagnostics and errors go to stderr):
-  Every section prints: byte range, declared vs available size, detected
-  format and a verdict. Broken parts do NOT abort the run: the WHY names
-  the exact cause, e.g.
-    frag 0 platform: INVALID lz4 block 6 truncated (need 3970208, have
-      1175831) — table slices one stream mid-block; table sum 30028782
-      vs header 30034170 (diff 5388)
-    kernel: TRUNCATED, header says 12345, file has 10000 (cut download?)
-    dtb: INVALID FDT 1 totalsize runs past dtb end (overlay typo?)
-  A stale-table vendor_boot additionally yields
-  vendor_ramdisk/ramdisk.full-rescue.cpio (the whole blob decoded as one
-  valid stream, with its file count) so the content is still recoverable.
-  vendor_boot with dtb_size 0 is legal (dtb absent, not broken).
-  Final line is RESULT: OK (exit 0) or RESULT: DEGRADED (exit 0 too —
-  grep for INVALID in scripts; exit 2 only when even the header is
-  unreadable and nothing can be dumped).
-
-Typical sessions:
-  bootsmasher unpack vendor_boot.img -o dir -h -x
-  bootsmasher u boot.img -o dir -n          # raw, magiskboot-style
-  bootsmasher unpack broken.img -o dir      # degraded + rescue file
-  NOTE: unpack always writes files, never stdout (use the vboot
-  subprogram for pipe mode).
-
-Exit codes: 0 unpacked (possibly DEGRADED, see report), 1 usage error,
-  2 unreadable image (bad magic / truncated header).";
-
-pub fn run(args: &[String]) -> i32 {
+pub fn run(args: &[String], prog: &str) -> i32 {
+    if args.iter().any(|a| a == "--help") {
+        println!("{}", help::short(prog));
+        return 0;
+    }
+    if args.iter().any(|a| a == "--expand") {
+        println!("{}", help::expand(prog));
+        return 0;
+    }
     match run_inner(args) {
         Ok(degraded) => {
             println!("RESULT: {}", if degraded { "DEGRADED (see INVALID lines above)" } else { "OK" });
             0
         }
         Err(Error::Usage(m)) => {
-            eprintln!("usage error: {m}\n{HELP}");
+            eprintln!("usage error: {m}\n{}", help::short(prog));
             1
         }
         Err(e) => {
@@ -129,9 +63,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            // NOTE: -h dumps the header FILE (magiskboot parity);
-            // use --help for this text.
-            "--help" => return Err(Error::Usage("help requested".to_string())),
+            // NOTE: -h dumps the header FILE (magiskboot parity).
             "-h" => header = true,
             "-n" => raw = true,
             "-x" | "--extract" => extract = true,
@@ -295,9 +227,9 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
 
     // DTB / bootconfig (available bytes, even when truncated).
     let page = hdr.page_size.max(1) as usize;
-    let rs = crate::vboot::image::align_up(hdr.header_size as usize, page);
+    let rs = crate::common::vendor::align_up(hdr.header_size as usize, page);
     let ram_end = rs + hdr.ramdisk_size as usize;
-    let dtb_start = crate::vboot::image::align_up(ram_end, page);
+    let dtb_start = crate::common::vendor::align_up(ram_end, page);
     let dtb_avail = dtb_start
         .checked_add(d.dtb_available)
         .map(|e| &bytes[dtb_start.min(bytes.len())..e.min(bytes.len())])
@@ -316,8 +248,8 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
         write_file(dir, "dtb", dtb_avail)?;
     }
     let dtb_end = dtb_start + hdr.dtb_size as usize;
-    let table_end = crate::vboot::image::align_up(dtb_end, page) + hdr.table_size as usize;
-    let bc_off = crate::vboot::image::align_up(table_end, page);
+    let table_end = crate::common::vendor::align_up(dtb_end, page) + hdr.table_size as usize;
+    let bc_off = crate::common::vendor::align_up(table_end, page);
     let bc_avail = bc_off
         .checked_add(d.bootconfig_available)
         .map(|e| &bytes[bc_off.min(bytes.len())..e.min(bytes.len())])
@@ -338,7 +270,7 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
     }
 
     // Footer: bytes after the computed image end (file + report only).
-    let img_end = crate::vboot::image::align_up(bc_off + hdr.bootconfig_size as usize, page);
+    let img_end = crate::common::vendor::align_up(bc_off + hdr.bootconfig_size as usize, page);
     write_footer(dir, bytes, img_end)?;
 
     if cli.header {
@@ -353,9 +285,9 @@ fn unpack_vendor(cli: &Cli, bytes: &[u8]) -> Result<bool> {
     Ok(degraded)
 }
 
-fn frag_slice<'a>(bytes: &'a [u8], hdr: &crate::vboot::image::Header, off: usize, len: usize) -> &'a [u8] {
+fn frag_slice<'a>(bytes: &'a [u8], hdr: &crate::common::vendor::Header, off: usize, len: usize) -> &'a [u8] {
     let page = hdr.page_size.max(1) as usize;
-    let rs = crate::vboot::image::align_up(hdr.header_size as usize, page);
+    let rs = crate::common::vendor::align_up(hdr.header_size as usize, page);
     let s = rs + off;
     if s >= bytes.len() {
         return &[];
@@ -366,14 +298,14 @@ fn frag_slice<'a>(bytes: &'a [u8], hdr: &crate::vboot::image::Header, off: usize
 /// board_id hex of table entry `index` (None when all zero or unreadable).
 fn frag_board_id(
     bytes: &[u8],
-    hdr: &crate::vboot::image::Header,
+    hdr: &crate::common::vendor::Header,
     index: usize,
 ) -> Option<String> {
     let page = hdr.page_size.max(1) as usize;
-    let rs = crate::vboot::image::align_up(hdr.header_size as usize, page);
+    let rs = crate::common::vendor::align_up(hdr.header_size as usize, page);
     let ram_end = rs + hdr.ramdisk_size as usize;
-    let dtb_start = crate::vboot::image::align_up(ram_end, page);
-    let table_off = crate::vboot::image::align_up(dtb_start + hdr.dtb_size as usize, page);
+    let dtb_start = crate::common::vendor::align_up(ram_end, page);
+    let table_off = crate::common::vendor::align_up(dtb_start + hdr.dtb_size as usize, page);
     let e_off = table_off + index * 108;
     let entry = bytes.get(e_off..e_off + 108)?;
     let board = &entry[44..108];
@@ -383,8 +315,8 @@ fn frag_board_id(
     Some(spec::hex_encode(board))
 }
 
-fn whole_blob<'a>(bytes: &'a [u8], hdr: &crate::vboot::image::Header) -> &'a [u8] {    let page = hdr.page_size.max(1) as usize;
-    let rs = crate::vboot::image::align_up(hdr.header_size as usize, page);
+fn whole_blob<'a>(bytes: &'a [u8], hdr: &crate::common::vendor::Header) -> &'a [u8] {    let page = hdr.page_size.max(1) as usize;
+    let rs = crate::common::vendor::align_up(hdr.header_size as usize, page);
     let e = (rs + hdr.ramdisk_size as usize).min(bytes.len());
     &bytes[rs.min(bytes.len())..e]
 }
@@ -418,7 +350,7 @@ fn try_decompress_cpio(slice: &[u8], stored_format: &str) -> Option<(Vec<u8>, us
 fn extract_report(vdir: &Path, fname: &str, cpio_bytes: &[u8]) -> Result<()> {
     let stem = fname.strip_suffix(".cpio").unwrap_or(fname);
     let dest = vdir.join(format!("{stem}.d"));
-    match cpiox::extract(cpio_bytes, &dest) {
+    match extract::extract(cpio_bytes, &dest) {
         Ok(r) => {
             say(&format!(
                 "  extract: {} -> {} files, {} dirs, {} symlinks{}",
@@ -477,7 +409,7 @@ fn write_footer(dir: &Path, bytes: &[u8], img_end: usize) -> Result<()> {
 }
 
 fn write_vendor_spec(
-    hdr: &crate::vboot::image::Header,
+    hdr: &crate::common::vendor::Header,
     d: &ops::Diagnosis,
     ramdisks: Vec<spec::RamdiskSpec>,
     dir: &Path,
@@ -781,7 +713,7 @@ fn try_ramdisk_cpio(data: &[u8], fmt: Format) -> Option<(Vec<u8>, usize)> {
 fn extract_boot_report(dir: &Path, fname: &str, cpio_bytes: &[u8]) -> Result<()> {
     let stem = fname.strip_suffix(".cpio").unwrap_or(fname);
     let dest = dir.join(format!("{stem}.d"));
-    match cpiox::extract(cpio_bytes, &dest) {
+    match extract::extract(cpio_bytes, &dest) {
         Ok(r) => {
             say(&format!(
                 "  extract: {} -> {} files, {} dirs, {} symlinks{}",

@@ -6,7 +6,7 @@
 //! (`len & 0x7FFF_FFFF` bytes); otherwise it is an LZ4 block frame.
 //! Uncompressed blocks are at most 8 MiB. Pure-Rust via `lz4_flex`.
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 pub const LEGACY_MAGIC: [u8; 4] = [0x02, 0x21, 0x4C, 0x18];
 pub const MAX_BLOCK_OUT: usize = 8 * 1024 * 1024;
@@ -15,7 +15,26 @@ pub const MAX_BLOCK_OUT: usize = 8 * 1024 * 1024;
 pub enum BlobKind {
     Lz4Legacy,
     Cpio,
+    Gzip,
+    Xz,
+    Lzma,
+    Lz4Frame,
     Unknown,
+}
+
+impl BlobKind {
+    /// Short format name for reports and spec.toml.
+    pub fn name(self) -> &'static str {
+        match self {
+            BlobKind::Lz4Legacy => "lz4_legacy",
+            BlobKind::Cpio => "cpio",
+            BlobKind::Gzip => "gzip",
+            BlobKind::Xz => "xz",
+            BlobKind::Lzma => "lzma",
+            BlobKind::Lz4Frame => "lz4",
+            BlobKind::Unknown => "unknown",
+        }
+    }
 }
 
 /// Sniff the blob: legacy magic, newc cpio magic (`070701`), else unknown.

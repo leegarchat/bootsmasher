@@ -7,7 +7,7 @@
 //! A 64 MiB partition dump is the same image zero-padded to the block
 //! device size, optionally with vbmeta + AVB footer after it.
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 pub const VENDOR_BOOT_MAGIC: &[u8; 8] = b"VNDRBOOT";
 pub const HEADER_LEN: usize = 2128;

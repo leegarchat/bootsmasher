@@ -4,7 +4,7 @@
 //! content: it walks entries by the header-declared sizes and only
 //! interprets the pathname for the dlkm split decision.
 
-use crate::error::{Error, Result};
+use crate::common::error::{Error, Result};
 
 const HDR_LEN: usize = 110;
 const TRAILER: &[u8] = b"TRAILER!!!";
@@ -129,6 +129,14 @@ pub fn is_recovery_path(name: &str) -> bool {
         || name.starts_with("recovery/")
         || name == "debug_ramdisk"
         || name.starts_with("debug_ramdisk/")
+}
+
+/// A first-stage entry: the `first_stage_ramdisk` dir itself or anything
+/// under it. This is the unit the vboot `--drop first-stage` selector and
+/// the inbuild-vs-cpio first-stage rule operate on (root-level `init`
+/// is ordinary platform payload, not first-stage).
+pub fn is_first_stage_path(name: &str) -> bool {
+    name == "first_stage_ramdisk" || name.starts_with("first_stage_ramdisk/")
 }
 
 /// newc mode field lives at header bytes 14..22 (after 6 magic + 8 ino).

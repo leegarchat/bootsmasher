@@ -9,59 +9,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::codec::{self, Format};
-use crate::error::{Error, Result};
+use crate::common::codec::{self, Format};
+use crate::common::error::{Error, Result};
 
-const HELP: &str = "bootsmasher cpio — newc archive surgery (magiskboot port)
-Alias: c.
+pub(crate) mod help;
 
-Usage:
-  bootsmasher cpio <incpio> [commands...]
-  bootsmasher cpio --help
-
-Each command is a single argument; quote it in the shell.
-Modifications are done in-place: the file is rewritten after the last
-command (except ls/test/exists, which report and exit without writing).
-A missing <incpio> starts an empty archive. Input must be a raw newc
-cpio (070701) — unpack without -n first, or decompress the .lz4.
-
-Supported commands (magiskboot parity):
-  exists ENTRY
-    Exit 0 if ENTRY exists, else 1 (nothing is written).
-  ls [-r] [PATH]
-    List PATH (\"/\" by default); -r lists recursively. Prints
-    '<mode> <uid> <gid> <size> <rdev>\\t<name>' per entry to stdout.
-  rm [-r] ENTRY
-    Remove ENTRY; -r removes the whole subtree.
-  mkdir MODE ENTRY
-    Create directory ENTRY with octal permissions MODE (e.g. 755).
-  ln TARGET ENTRY
-    Create a symlink to TARGET named ENTRY.
-  mv SOURCE DEST
-    Move (rename) SOURCE to DEST. Error if SOURCE is missing.
-  add MODE ENTRY INFILE
-    Add host file INFILE as ENTRY with octal MODE; replaces ENTRY if it
-    exists. Symlinks are stored as regular files (use ln for links);
-    block/char devices keep their device numbers; anything else is an
-    error. ENTRY must not end with '/'.
-  extract [ENTRY OUT]
-    Extract ENTRY to OUT (parents created, unix modes applied); with no
-    args extracts every entry into the current directory.
-  test
-    Exit code only, nothing written:
-    0 = stock, 1 = Magisk-patched, 2 = unsupported (SuperSU/xposed).
-  patch
-    Apply ramdisk patches: strip verify/avb/forceencrypt flags from
-    fstab files (honors KEEPVERITY / KEEPFORCEENCRYPT env, \"true\" keeps).
-  backup ORIG [-n]
-    Diff ORIG against <incpio>: changed/removed ORIG entries land in
-    .backup/ (xz-compressed unless -n), new entries go to .backup/.rmlist.
-  restore
-    Restore from the embedded .backup (xz entries decompressed).
-
-Exit codes: 0 ok (test: 0 stock / 1 Magisk; exists: 0 found),
-1 usage error (also: exists missing, test Magisk/unsupported),
-2 broken input (bad magic/header, unreadable file).";
 
 // newc file-type bits (same values as libc S_IF*).
 const S_IFMT: u32 = 0o170000;
@@ -278,6 +230,7 @@ impl Cpio {
                 std::fs::create_dir_all(dir)?;
             }
         }
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let mode = entry.mode & 0o777;
         match entry.mode & S_IFMT {
             S_IFDIR => {
@@ -730,15 +683,19 @@ fn entry_line(e: &CpioEntry) -> String {
 
 /// Run one `cpio <incpio> [commands...]` invocation.
 /// Returns the process exit code directly (test/exists use 1/2 too).
-pub fn run(args: &[String]) -> i32 {
+pub fn run(args: &[String], prog: &str) -> i32 {
     if args.iter().any(|a| a == "--help") {
-        println!("{HELP}");
+        println!("{}", help::short(prog));
+        return 0;
+    }
+    if args.iter().any(|a| a == "--expand") {
+        println!("{}", help::expand(prog));
         return 0;
     }
     match run_inner(args) {
         Ok(code) => code,
         Err(Error::Usage(m)) => {
-            eprintln!("usage error: {m}\n{HELP}");
+            eprintln!("usage error: {m}\n{}", help::short(prog));
             1
         }
         Err(Error::Fail(m)) => {

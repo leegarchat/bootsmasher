@@ -9,141 +9,32 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::bootimg;
-use crate::codec::{self, Format};
-use crate::error::{Error, Result};
-use crate::spec;
-use crate::vboot::cpio;
-use crate::vboot::dtb;
-use crate::vboot::image::{Header, RamdiskEntry, TYPE_DLKM, TYPE_PLATFORM, TYPE_RECOVERY};
+use crate::common::bootimg;
+use crate::common::codec::{self, Format};
+use crate::common::error::{Error, Result};
+use crate::common::spec;
+use crate::common::cpio;
+use crate::common::dtb;
+use crate::common::vendor::{Header, RamdiskEntry, TYPE_DLKM, TYPE_PLATFORM, TYPE_RECOVERY};
 use crate::vboot::ops;
-use crate::vboot::space;
+use crate::common::space;
 
-const HELP: &str = "bootsmasher repack — rebuild boot/vendor_boot from an unpack dir
-Aliases: r, rp.
+pub(crate) mod help;
 
-Usage:
-  bootsmasher repack [dir=\".\"] [out=\"new-boot.img\"] [options]
-  bootsmasher repack --help
 
-Layout source (need one of; checked in this order):
-  dir/spec.toml            Lean record from 'bootsmasher unpack': kind,
-                           version, page, header scalars, per-section
-                           file/format/size (+ names/types/board_id for
-                           vendor ramdisks). A repack from the dir alone
-                           works when every nonzero section has its file.
-                           Sizes in spec are advisory: all header sizes
-                           and table offsets are recomputed from the real
-                           file bytes, so editing files never breaks the
-                           build (spec sizes are only used in the
-                           'missing file' error text).
-  --base <img> (-b)        Original image (magiskboot parity): sizes,
-                           formats and missing-file bytes come from it.
-                           Without spec the table names/types come from
-                           the base image table.
-  --template <img> (-t)    Foreign image: header scalars (cmdline, name,
-                           addrs, page, os_version...) are taken from it;
-                           section bytes still come from dir/--base.
-                           Example: LOS ramdisk + stock cmdline.
-
-Options:
-  -o <file>, --out <file>  Output image path. Default: positional [out],
-                           default new-boot.img. -o and positional out
-                           together are an error.
-  -b <img>, --base <img>   See above.
-  -t <img>, --template <img>  See above.
-  -s k=v, --set k=v        Header scalar override, repeatable, wins over
-                           everything except a later --set. Keys:
-                             cmdline        free text (may contain spaces
-                                            if quoted by the shell)
-                             name           product name (<= 16 chars)
-                             os_version     A.B.C, 7-bit parts (boot only)
-                             os_patch_level Y-MM, e.g. 2026-09 (boot only)
-                             page_size      2048 / 4096 (decimal or 0x...)
-                             kernel_addr | ramdisk_addr | second_addr |
-                             tags_addr      32-bit load addresses
-                             dtb_addr       64-bit load address
-                           Unknown keys and boot-only keys on vendor_boot
-                           are usage errors (exit 1), never silent.
-  -f target=fmt, --format target=fmt
-                           Compression target, repeatable. Target is a file
-                           name (kernel, ramdisk.cpio, dlkm.cpio, dtb...)
-                           or a group: 'ramdisk' (every ramdisk fragment)
-                           or 'all'. Formats:
-                             raw | gzip | xz | lzma | lz4 | lz4_legacy
-                           ('none'/'cpio' also mean raw; 'lz4_lg' means
-                           lz4_legacy). Precedence per section: exact file
-                           match > ramdisk-group > all > spec
-                           stored_format > --base detected format > raw.
-  -n                       Skip all compression: every present file is
-                           copied verbatim (magiskboot parity for -n).
-                           Unpack -n + repack -n is byte-identical to the
-                           source prefix.
-  --drop-footer            Omit trailing bytes (dir/footer.bin or base
-                           tail). Shrinks the image; use with --pad-to to
-                           re-pad to the block-device size.
-  --pad-to <bytes>         Append zeros up to this size (e.g. 67108864).
-                           Fails (nothing written) if the image is bigger.
-  --min-free <size>        Reserve: output dir must fit image + reserve.
-                           Plain bytes or human (512M, 1GiB, 1.5G; K/M/G/T
-                           are binary). Default 0.
-  --check-dir <dir>        Check free space in <dir> instead of the output
-                           file's parent directory.
-
-Header scalar precedence (later wins):
-  spec.toml (or --base) -> dir/header (magiskboot parity: name, cmdline,
-  os_version, os_patch_level) -> --template -> --set k=v.
-
-Component formats in detail:
-  A file that already sniffs as compressed is copied verbatim
-  (magiskboot parity); a raw cpio/text file is compressed to the target
-  format. v4 boot ramdisk is forced to lz4_legacy like magiskboot does
-  (GKI merge rule: vendor ramdisks must share one method), unless -n or
-  an explicit --format says otherwise — the forcing is reported as
-  'RAMDISK_FMT: [old] -> [lz4_legacy]'.
-
-Vendor_boot specifics:
-  The ramdisk table is rebuilt from scratch: offsets rechained from the
-  new blob sizes, types/names from spec (or --base table), board_id from
-  spec board_id_hex (128 hex chars = 64 bytes, absent = zeros).
-  dtb/bootconfig come from files, else --base bytes, else a clean error
-  naming the missing size.
-
-Boot specifics:
-  kernel + kernel_dtb files concatenate (kernel_dtb is honored only with
-  an explicit kernel file; otherwise a warning, base bytes kept). The
-  recovery_dtbo offset field is refreshed to the real position. v4
-  signature comes from the file, else --base bytes. dtb is NOT split out
-  of kernel on repack (only on unpack).
-
-Footer and AVB:
-  Kept by default: dir/footer.bin (written by unpack, not recorded in
-  spec), else --base trailing bytes (vbmeta + AVB footer). --drop-footer
-  omits it. AVB hashes never survive content changes anyway — resign the
-  image afterwards if the verified-boot chain matters.
-
-Output:
-  Always a file (default new-boot.img). --pad-to appends zeros. Free
-  space is checked first (output parent or --check-dir must fit image +
-  --min-free). The rebuilt image is re-parsed and every section
-  re-verified in memory (ramdisk cpio, FDTs, table chaining); on failure
-  nothing is written (exit 2).
-
-Typical sessions:
-  bootsmasher repack dir fixed.img
-  bootsmasher r dir fox.img -b stock.img -f ramdisk.cpio=gzip
-  bootsmasher repack pinit/ init_new.img --set cmdline=\"console=ttyS0\" -n
-  bootsmasher repack dir out.img --drop-footer --pad-to 67108864
-  bootsmasher repack broken-dir/ out.img --base broken.img
-    # refuses (exit 2): refuses to emit an invalid image
-
-Exit codes: 0 ok, 1 usage error, 2 broken input / failed verification.";
-
-pub fn run(args: &[String]) -> i32 {
+pub fn run(args: &[String], prog: &str) -> i32 {
+    if args.iter().any(|a| a == "--help") {
+        println!("{}", help::short(prog));
+        return 0;
+    }
+    if args.iter().any(|a| a == "--expand") {
+        println!("{}", help::expand(prog));
+        return 0;
+    }
     match run_inner(args) {
         Ok(()) => 0,
         Err(Error::Usage(m)) => {
-            eprintln!("usage error: {m}\n{HELP}");
+            eprintln!("usage error: {m}\n{}", help::short(prog));
             1
         }
         Err(e) => {
@@ -182,7 +73,6 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "-h" | "--help" => return Err(Error::Usage("help requested".to_string())),
             "-n" => no_compress = true,
             "--drop-footer" => drop_footer = true,
             "-o" | "--out" => {
@@ -223,7 +113,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
             "--min-free" => {
                 i += 1;
                 let v = args.get(i).ok_or_else(|| Error::Usage("--min-free needs a value".to_string()))?;
-                min_free = crate::vboot::space::parse_size(v)?;
+                min_free = crate::common::space::parse_size(v)?;
             }
             "--check-dir" => {
                 i += 1;
@@ -710,7 +600,7 @@ fn repack_vendor(
     hdr.table_entry_num = entries.len() as u32;
     hdr.table_entry_size = 108;
     hdr.table_size = entries.len() as u32 * 108;
-    let out = ops::assemble(&hdr, &frags, &entries, &dtb, &bc);
+    let out = ops::assemble(&hdr, &frags, &entries, &dtb, &bc, b"");
     ops::verify_image(&out).map_err(|e| Error::Verify(format!("rebuilt image invalid: {e}")))?;
     // Footer: dir/footer.bin else base trailing bytes (unless dropped).
     let mut out = out;
@@ -721,10 +611,10 @@ fn repack_vendor(
         } else if let Some(b) = base {
             let base_end = base_img.as_ref().map(|im| {
                 let page = im.hdr.page_size as usize;
-                crate::vboot::image::align_up(
-                    crate::vboot::image::align_up(
-                        crate::vboot::image::align_up(
-                            crate::vboot::image::align_up(im.hdr.header_size as usize, page)
+                crate::common::vendor::align_up(
+                    crate::common::vendor::align_up(
+                        crate::common::vendor::align_up(
+                            crate::common::vendor::align_up(im.hdr.header_size as usize, page)
                                 + im.hdr.ramdisk_size as usize,
                             page,
                         ) + im.hdr.dtb_size as usize,
@@ -733,7 +623,7 @@ fn repack_vendor(
                     page,
                 ) + im.hdr.bootconfig_size as usize
             }).unwrap_or(0);
-            let base_end = crate::vboot::image::align_up(base_end, base_img.as_ref().map(|im| im.hdr.page_size as usize).unwrap_or(2048));
+            let base_end = crate::common::vendor::align_up(base_end, base_img.as_ref().map(|im| im.hdr.page_size as usize).unwrap_or(2048));
             if base_end < b.len() {
                 out.extend_from_slice(&b[base_end..]);
                 emit_err(&format!("footer: appended base trailing bytes ({} bytes)", b.len() - base_end));

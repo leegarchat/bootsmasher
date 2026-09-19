@@ -1245,6 +1245,21 @@ fn build_recovery(
         }
     }
     let (_, _, pool_lib) = cpio::partition(&pool);
+    // Modules already stored outside platform? A kept non-platform,
+    // non-recovery fragment holding lib/** payload (16K, a dlkm under
+    // another name, ...) means pulling a second copy into a fresh dlkm
+    // is pure duplication (and may overflow the partition). Recovery
+    // originals don't count: they are being replaced.
+    // (A valid TYPE_DLKM above already won verbatim.)
+    let pool_lib_stored = orig.table_ok
+        && orig.frags.iter().any(|(e, en)| {
+            e.entry_type != TYPE_PLATFORM
+                && e.entry_type != TYPE_RECOVERY
+                && {
+                    let (_, _, lib) = cpio::partition(en);
+                    cpio::has_payload(&lib)
+                }
+        });
     if let Some((mut e, raw)) = orig_valid_dlkm {
         e.offset = off;
         e.size = raw.len() as u32;
@@ -1252,6 +1267,8 @@ fn build_recovery(
         frags.push(raw);
         table.push(e.clone());
         produced.push((TYPE_DLKM, e.name_str()));
+    } else if pool_lib_stored {
+        eprintln!("note: kept fragment(s) already store lib/** modules, no fresh dlkm pulled");
     } else if cpio::has_payload(&pool_lib) {
         let (dlkm_raw, e) = encode_fragment(&pool_lib, TYPE_DLKM, off, board_id_of(im, kept, TYPE_DLKM));
         let n_lib = pool_lib.iter().filter(|e| cpio::name_str(e) != "TRAILER!!!").count();

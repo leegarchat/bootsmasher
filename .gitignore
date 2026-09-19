@@ -2,3 +2,4 @@ target
 Cargo.lock
 dist
 test*
+recovery_install_components

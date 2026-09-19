@@ -109,19 +109,21 @@ pub fn decompress_legacy(blob: &[u8]) -> Result<Vec<u8>> {
 /// directly against each other (or blob end), and the `lz4` CLI treats
 /// a zero word as corruption. The decoder still tolerates a marker for
 /// robustness against foreign packers.
+///
+/// Every block is stored as a valid LZ4 block stream, even when that is
+/// larger than the input: the 0x80000000 "stored raw" form is never
+/// emitted. Minimal legacy decoders (the `lz4` CLI legacy mode, LK/aboot
+/// on Pixel bootloaders) reject raw blocks and abort the whole image —
+/// instant reboot at the logo — while accepting plain compressed blocks
+/// of any size. Verified: a stream with one 8 MiB raw block fails
+/// `lz4 -d`, the same bytes as plain blocks decode fine.
 pub fn compress_legacy(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len() / 2 + 16);
     out.extend_from_slice(&LEGACY_MAGIC);
     for chunk in raw.chunks(MAX_BLOCK_OUT) {
         let comp = lz4_flex::block::compress(chunk);
-        // Store literally when compression does not pay off.
-        if comp.len() >= chunk.len() {
-            out.extend_from_slice(&((chunk.len() as u32) | 0x8000_0000).to_le_bytes());
-            out.extend_from_slice(chunk);
-        } else {
-            out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
-            out.extend_from_slice(&comp);
-        }
+        out.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+        out.extend_from_slice(&comp);
     }
     out
 }

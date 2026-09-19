@@ -13,6 +13,8 @@ Subprograms:
   decompress    expand one archive by magic
   pick          arrow-key menu for installer scripts (device/slot pick,
                 Continue/Exit pacing, flash confirmation)
+  install       OrangeFox vendor_boot installer (export.txt paths,
+                bootloader-only fetch/flash, per-slot report)
 
 Usage:
   {prog} <subprogram> [args...]
@@ -52,6 +54,9 @@ pub fn expand(prog: &str) -> String {
   decompress: magic sniff + decode, extension stripped by default.
   pick: Up/Down + Enter menu, prints the choice (exit 0), Esc aborts
     (exit 1, empty stdout); --default answers without a terminal.
+  install: in-binary port of recovery_install_components/install.sh
+    (install.sh/install.bat only forward args); paths from export.txt,
+    rebuild/verify in-process, device traffic via fastboot/adb.
 
 Notes: pure Rust, no external commands; diagnostics go to stderr, so
 stdout stays a clean pipe (vboot/compress/decompress)."

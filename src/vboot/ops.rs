@@ -12,6 +12,24 @@ use crate::common::dtb;
 use crate::common::vendor::{align_up, type_name, Header, RamdiskEntry, HEADER_LEN};
 use crate::common::vendor::{TYPE_DLKM, TYPE_PLATFORM, TYPE_RECOVERY};
 use crate::common::lz4legacy::{self, BlobKind};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Build diagnostics gate: `vboot` CLI prints them on stderr;
+/// embedders (e.g. `install`) set QUIET to keep the console short
+/// (the verdict still lands in their log).
+pub(crate) static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn note_impl(line: String) {
+    if !QUIET.load(Ordering::Relaxed) {
+        eprintln!("{line}");
+    }
+}
+
+macro_rules! note {
+    ($($t:tt)*) => {
+        $crate::vboot::ops::note_impl(format!($($t)*))
+    };
+}
 
 /// Repack layout selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -860,7 +878,7 @@ fn apply_first_stage(
         new_entries.iter().filter(|e| cpio::is_first_stage_path(&cpio::name_str(e))).count();
     if drops.first_stage {
         if new_fs == 0 {
-            eprintln!(
+            note!(
                 "warning: inbuild first-stage dropped (--drop first-stage) but {label} has none; result platform has no first-stage"
             );
         }
@@ -868,17 +886,17 @@ fn apply_first_stage(
     }
     let base_fs = base_first_stage(im, kept, use_frags);
     if base_fs.is_empty() {
-        eprintln!("warning: no readable inbuild first-stage, using {label} as-is");
+        note!("warning: no readable inbuild first-stage, using {label} as-is");
         return (new_entries, false);
     }
     let (stripped, n) = strip_first_stage(new_entries);
     if n > 0 {
-        eprintln!(
+        note!(
             "kept inbuild first-stage ({} entries), dropped {n} first-stage entries from {label}",
             base_fs.len()
         );
     } else {
-        eprintln!("kept inbuild first-stage ({} entries), {label} has none", base_fs.len());
+        note!("kept inbuild first-stage ({} entries), {label} has none", base_fs.len());
     }
     let mut out = base_fs;
     out.extend(stripped);
@@ -961,7 +979,7 @@ fn strip_platforms(
         if e.entry_type == TYPE_PLATFORM {
             let (stripped, n) = strip_first_stage(blob_entries(&raw)?);
             if n > 0 {
-                eprintln!("dropped {n} first-stage entries from a platform fragment (--drop first-stage)");
+                note!("dropped {n} first-stage entries from a platform fragment (--drop first-stage)");
             }
             f.push(lz4legacy::compress_legacy(&cpio::build(&stripped)));
         } else {
@@ -1075,7 +1093,7 @@ fn carryovers(im: &Image, produced: &[(u32, String)], kept: &[bool]) -> Vec<(Ram
                 ne.offset = 0; // rechained by the caller
                 out.push((ne, b.to_vec()));
             }
-            _ => eprintln!(
+            _ => note!(
                 "warning: original {} fragment {:?} unreadable, not carried over",
                 type_name(e.entry_type),
                 e.name_str()
@@ -1097,7 +1115,7 @@ fn append_carryovers(
     for (mut e, raw) in carryovers(im, produced, kept) {
         e.offset = off;
         off += raw.len() as u32;
-        eprintln!(
+        note!(
             "carried over {} fragment {:?} verbatim ({} bytes)",
             type_name(e.entry_type),
             e.name_str(),
@@ -1143,7 +1161,7 @@ fn build_recovery(
         orig.frags.iter().map(|(e, en)| (e.entry_type, en.clone())).collect()
     } else {
         if !drops.frags.is_empty() {
-            eprintln!(
+            note!(
                 "warning: table unusable, --drop fragment selectors have no effect on whole-blob rescue"
             );
         }
@@ -1171,7 +1189,7 @@ fn build_recovery(
     if drops.first_stage {
         let (stripped, n) = strip_first_stage(fs_entries);
         if n > 0 {
-            eprintln!("dropped {n} first-stage entries from the base pool (--drop first-stage)");
+            note!("dropped {n} first-stage entries from the base pool (--drop first-stage)");
         }
         fs_entries = stripped;
     }
@@ -1180,14 +1198,14 @@ fn build_recovery(
             "refusing recovery install: no first_stage_ramdisk/** in the kept base content (platform would be empty)".to_string(),
         ));
     }
-    eprintln!(
+    note!(
         "first-stage: {} entries ({} from platform, {} from other fragments) -> new platform",
         fs_entries.len(),
         fs_plat,
         fs_other,
     );
     if fs_other > 0 {
-        eprintln!(
+        note!(
             "warning: first-stage harvested from non-platform fragments (old recovery); it moves to platform so replacing recovery stays safe"
         );
     }
@@ -1198,7 +1216,7 @@ fn build_recovery(
         .map_err(|e| Error::Parse(format!("internal error re-reading recovery file: {e}")))?;
     let (fox_stripped, n) = strip_first_stage(fox_entries);
     if n > 0 {
-        eprintln!("dropped {n} first-stage duplicates from {label} (inbuild first-stage wins)");
+        note!("dropped {n} first-stage duplicates from {label} (inbuild first-stage wins)");
     }
     let fox_rec = cpio::drop_trailers(&fox_stripped);
     if fox_rec.is_empty() {
@@ -1220,7 +1238,7 @@ fn build_recovery(
     let mut table: Vec<RamdiskEntry> = Vec::new();
     let (plat_raw, e0) = encode_fragment(&fs_entries, TYPE_PLATFORM, 0, board_id_of(im, kept, TYPE_PLATFORM));
     let mut off = plat_raw.len() as u32;
-    eprintln!("platform: {} first-stage entries ({} bytes)", fs_entries.len(), plat_raw.len());
+    note!("platform: {} first-stage entries ({} bytes)", fs_entries.len(), plat_raw.len());
     frags.push(plat_raw);
     table.push(e0);
     let mut er_name = [0u8; 32];
@@ -1233,7 +1251,7 @@ fn build_recovery(
         board_id: rec_bid,
     };
     off += fox_bytes.len() as u32;
-    eprintln!("recovery: {} entries from {label} ({} bytes)", fox_rec.len(), fox_bytes.len());
+    note!("recovery: {} entries from {label} ({} bytes)", fox_rec.len(), fox_bytes.len());
     frags.push(fox_bytes);
     table.push(er);
     // produced[] tracks (type, name) for the carryover filter; every kept
@@ -1263,21 +1281,21 @@ fn build_recovery(
     if let Some((mut e, raw)) = orig_valid_dlkm {
         e.offset = off;
         e.size = raw.len() as u32;
-        eprintln!("dlkm: kept original {:?} verbatim ({} bytes)", e.name_str(), raw.len());
+        note!("dlkm: kept original {:?} verbatim ({} bytes)", e.name_str(), raw.len());
         frags.push(raw);
         table.push(e.clone());
         produced.push((TYPE_DLKM, e.name_str()));
     } else if pool_lib_stored {
-        eprintln!("note: kept fragment(s) already store lib/** modules, no fresh dlkm pulled");
+        note!("note: kept fragment(s) already store lib/** modules, no fresh dlkm pulled");
     } else if cpio::has_payload(&pool_lib) {
         let (dlkm_raw, e) = encode_fragment(&pool_lib, TYPE_DLKM, off, board_id_of(im, kept, TYPE_DLKM));
         let n_lib = pool_lib.iter().filter(|e| cpio::name_str(e) != "TRAILER!!!").count();
-        eprintln!("dlkm: pulled {n_lib} lib/** entries out of the base pool ({} bytes)", dlkm_raw.len());
+        note!("dlkm: pulled {n_lib} lib/** entries out of the base pool ({} bytes)", dlkm_raw.len());
         frags.push(dlkm_raw);
         table.push(e);
         produced.push((TYPE_DLKM, "dlkm".to_string()));
     } else if pool.iter().any(|e| cpio::is_dlkm_path(&cpio::name_str(e))) {
-        eprintln!("note: base pool holds lib/** dir entries only (no payload), no dlkm emitted");
+        note!("note: base pool holds lib/** dir entries only (no payload), no dlkm emitted");
     }
     append_carryovers(&mut frags, &mut table, im, &produced, kept);
     Ok((frags, table))
@@ -1319,7 +1337,7 @@ pub fn repack_with_opts(
     let kept: Vec<bool> = im.table.iter().map(|e| !frag_dropped(&drops, e)).collect();
     for s in &drops.frags {
         if !im.table.iter().any(|e| frag_selector_matches(s, e)) {
-            eprintln!("warning: --drop {s}: matched no fragment, ignored");
+            note!("warning: --drop {s}: matched no fragment, ignored");
         }
     }
     if !im.table.is_empty() && !kept.iter().any(|&k| k) {
@@ -1331,7 +1349,7 @@ pub fn repack_with_opts(
     // fragment boundaries in a single stream): warn when it is taken.
     let rescue_note = || {
         if !drops.frags.is_empty() {
-            eprintln!(
+            note!(
                 "warning: table unusable, --drop fragment selectors have no effect on whole-blob rescue"
             );
         }
@@ -1368,7 +1386,7 @@ pub fn repack_with_opts(
         if drops.first_stage {
             let (stripped, n) = strip_first_stage(en);
             if n > 0 {
-                eprintln!("dropped {n} first-stage entries from the pool (--drop first-stage)");
+                note!("dropped {n} first-stage entries from the pool (--drop first-stage)");
             }
             en = stripped;
         }
@@ -1386,7 +1404,7 @@ pub fn repack_with_opts(
             if let Ok(b) = im.frag_bytes(i) {
                 match blob_entries(b) {
                     Ok(en) => out.extend(en),
-                    Err(_) => eprintln!(
+                    Err(_) => note!(
                         "warning: original {} fragment unreadable, left out of the merge",
                         type_name(e.entry_type)
                     ),
@@ -1433,7 +1451,7 @@ pub fn repack_with_opts(
                 if drops.first_stage {
                     let (stripped, n) = strip_first_stage(en);
                     if n > 0 {
-                        eprintln!("dropped {n} first-stage entries from whole-blob rescue (--drop first-stage)");
+                        note!("dropped {n} first-stage entries from whole-blob rescue (--drop first-stage)");
                     }
                     let (raw, e) =
                         encode_fragment(&stripped, TYPE_PLATFORM, 0, board_id_of(&im, &kept, TYPE_PLATFORM));

@@ -130,6 +130,10 @@ struct Config {
     recovery_img: PathBuf,
     backup_dir: PathBuf,
     tools: Tools,
+    /// Minimum free bytes a flashed image must leave in the partition
+    /// (export.txt MIN_FREE_MB, default 7).
+    min_free: u64,
+    min_free_mb: u64,
 }
 
 fn strip_quotes(v: &str) -> &str {
@@ -218,7 +222,11 @@ fn resolve_config(export_path: &Path) -> Result<Config, String> {
     if !adb.is_file() {
         return Err(format!("missing adb binary: {}", adb.display()));
     }
-    Ok(Config { recovery_img, backup_dir, tools: Tools { fastboot, adb } })
+    let min_free_mb: u64 = match map.get("MIN_FREE_MB") {
+        None => 7,
+        Some(v) => v.parse().map_err(|_| format!("bad MIN_FREE_MB in export.txt: '{v}' (want MiB integer)"))?,
+    };
+    Ok(Config { recovery_img, backup_dir, tools: Tools { fastboot, adb }, min_free: min_free_mb * 1024 * 1024, min_free_mb })
 }
 
 // ------------------------------------------------------------ session ---
@@ -231,7 +239,6 @@ const LAUNCHER: &str = "./install.sh";
 
 const EXIT_ITEM: &str = "Exit";
 const BACK_ITEM: &str = "Back";
-const MIN_PART_FREE: u64 = 7 * 1024 * 1024;
 
 struct Ctx {
     cfg: Config,
@@ -240,7 +247,7 @@ struct Ctx {
     backup: PathBuf,
     pass: u32,
     fail: u32,
-    seven_mb_fail: bool,
+    policy_fail: bool,
     force: bool,
     serial: String,
     mode: String,
@@ -853,19 +860,19 @@ fn stage_prepare(ctx: &mut Ctx) -> bool {
         if psz == 0 || free < 0 {
             ctx.say(&format!("  slot {s}: {} / {}, free {} — DOES NOT FIT", mb(isz), mb(psz), mb(free_u)));
             ctx.bad(&format!("slot {s}: image does not fit partition"));
-        } else if !ctx.force && (free as u64) < MIN_PART_FREE {
-            ctx.say(&format!("  slot {s}: {} / {}, free {} — BELOW 7 MB POLICY", mb(isz), mb(psz), mb(free_u)));
-            ctx.bad(&format!("slot {s}: less than 7 MB free left in partition"));
-            ctx.seven_mb_fail = true;
-        } else if ctx.force && (free as u64) < MIN_PART_FREE {
-            ctx.say(&format!("  slot {s}: {} / {}, free {} — OK (--force: 7 MB policy waived)", mb(isz), mb(psz), mb(free_u)));
-            let _ = writeln!(ctx.log, "  (7 MB free-space policy waived under --force)");
+        } else if !ctx.force && (free as u64) < ctx.cfg.min_free {
+            ctx.say(&format!("  slot {s}: {} / {}, free {} — BELOW {} MB POLICY", mb(isz), mb(psz), mb(free_u), ctx.cfg.min_free_mb));
+            ctx.bad(&format!("slot {s}: less than {} MB free left in partition", ctx.cfg.min_free_mb));
+            ctx.policy_fail = true;
+        } else if ctx.force && (free as u64) < ctx.cfg.min_free {
+            ctx.say(&format!("  slot {s}: {} / {}, free {} — OK (--force: {} MB policy waived)", mb(isz), mb(psz), mb(free_u), ctx.cfg.min_free_mb));
+            let _ = writeln!(ctx.log, "  ({} MB free-space policy waived under --force)", ctx.cfg.min_free_mb);
         } else {
             ctx.say(&format!("  slot {s}: {} / {}, free {} — OK", mb(isz), mb(psz), mb(free_u)));
         }
     }
     if ctx.fail > 0 {
-        if ctx.seven_mb_fail {
+        if ctx.policy_fail {
             let fslots = if ctx.slots.len() == 2 { "both".to_string() } else { ctx.slots.join(" ") };
             let mut fcmd = format!("{LAUNCHER} --force --slot {fslots} --mode {}", ctx.mode);
             if ctx.mode == "restore" {
@@ -873,12 +880,12 @@ fn stage_prepare(ctx: &mut Ctx) -> bool {
                 fcmd.push_str(&format!(" --backup {shown}"));
             }
             ctx.say("");
-            ctx.say("  !! Partition would be left with less than 7 MB free.");
+            ctx.say(&format!("  !! Partition would be left with less than {} MB free.", ctx.cfg.min_free_mb));
             ctx.say("  !! Please send backup/<stamp>/install.log to the OrangeFox Pixel group:");
             ctx.say("  !!   @OFRPforTensorDiscussion (https://t.me/OFRPforTensorDiscussion)");
             ctx.say("  !! If you know what you are doing, rerun from a terminal:");
             ctx.say(&format!("  !!   {fcmd}"));
-            ctx.say("  !! (--force skips the 7 MB check; the fit check stays)");
+            ctx.say(&format!("  !! (--force skips the {} MB check; the fit check stays)", ctx.cfg.min_free_mb));
         }
         ctx.say("  report failed, nothing flashed");
         return false;
@@ -1126,7 +1133,7 @@ pub fn run(args: &[String], prog: &str) -> i32 {
         backup,
         pass: 0,
         fail: 0,
-        seven_mb_fail: false,
+        policy_fail: false,
         force: cli.force,
         serial: String::new(),
         mode: String::new(),

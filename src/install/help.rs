@@ -52,12 +52,14 @@ export.txt keys (all optional, built-ins shown):
   FASTBOOT_BIN=fastboot        (resolved inside the platform-tools dir;
   ADB_BIN=adb                   .exe is appended on Windows when missing)
 
-Free-space policy: a flashed image must leave >= 7 MiB free in the
-partition. Below that (but still fitting) the run fails: the user is
-asked to send install.log to @OFRPforTensorDiscussion
-(https://t.me/OFRPforTensorDiscussion) and is shown the exact --force
-command that waives the policy (--force never waives the hard fit
-check, and restore still needs --backup in --force mode).
+Free-space policy: a flashed image must leave >= MIN_FREE_MB MiB
+free in the partition (export.txt, default 7). Below that (but still
+fitting) the run fails: the user is asked to send install.log to
+@OFRPforTensorDiscussion (https://t.me/OFRPforTensorDiscussion) and
+is shown the exact --force command that waives the policy (--force
+never waives the hard fit check, and restore still needs --backup
+in --force mode). install-recovery.sh enforces the same policy
+strictly (no bypass).
 
 Selection stages (\"Back\" steps one level up; flag-fixed stages are
 skipped AND skipped over when stepping back; the flash prompt's

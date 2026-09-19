@@ -5,12 +5,13 @@
 //!   stale-table detection) -> build new fragment set -> assemble ->
 //!   verify rebuilt image in memory -> emit (file or stdout, no chatter).
 
-use crate::error::{Error, Result};
-use crate::vboot::cpio::{self, Entry};
-use crate::vboot::dtb;
-use crate::vboot::image::{align_up, type_name, Header, RamdiskEntry, HEADER_LEN};
-use crate::vboot::image::{TYPE_DLKM, TYPE_PLATFORM, TYPE_RECOVERY};
-use crate::vboot::lz4legacy::{self, BlobKind};
+use crate::common::error::{Error, Result};
+use crate::common::codec::{self, Format};
+use crate::common::cpio::{self, Entry};
+use crate::common::dtb;
+use crate::common::vendor::{align_up, type_name, Header, RamdiskEntry, HEADER_LEN};
+use crate::common::vendor::{TYPE_DLKM, TYPE_PLATFORM, TYPE_RECOVERY};
+use crate::common::lz4legacy::{self, BlobKind};
 
 /// Repack layout selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,68 @@ pub enum Mode {
     Merge,
 }
 
+/// Repack options: layout mode, `--drop` selectors and header overrides.
+///
+/// `drop` holds raw selectors: fragment type/name matchers (`platform`,
+/// `dlkm`, `recovery`, `none`, `16K`, ...) plus the special `first-stage`
+/// (also accepted as `first_stage`), which inverts the first-stage rule
+/// (see [`apply_first_stage`]).
+///
+/// `sets` holds `--set k=v` header overrides, applied to the output header
+/// after everything else (same keys as the repack subprogram's vendor
+/// path: cmdline, name, page_size, kernel_addr, ramdisk_addr, tags_addr,
+/// dtb_addr).
+///
+/// `recovery` holds the `--recovery <file>` payload (label, bytes): the
+/// recovery-install layout (see [`build_recovery`]). Conflicts with a
+/// platform file and with Split/Merge (enforced by the CLI, double-checked
+/// in [`repack_with_opts`]).
+///
+/// `drop_footer` (`--drop-footer`): omit the trailing vbmeta/AVB/padding
+/// tail instead of carrying it verbatim. Needed when the new content no
+/// longer fits the partition next to the old footer (recovery install
+/// grows the ramdisk); like `repack --drop-footer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackOpts {
+    pub mode: Mode,
+    pub drop: Vec<String>,
+    pub sets: Vec<(String, String)>,
+    pub recovery: Option<(String, Vec<u8>)>,
+    pub drop_footer: bool,
+}
+
+/// Parsed `--drop` list.
+struct DropSet {
+    /// Fragment selectors (table type or name).
+    frags: Vec<String>,
+    /// Drop the inbuild first-stage so the passed cpio's wins; without it
+    /// the cpio's first-stage entries are dropped and inbuild ones kept.
+    first_stage: bool,
+}
+
+fn parse_drop(drop: &[String]) -> DropSet {
+    let mut out = DropSet { frags: Vec::new(), first_stage: false };
+    for s in drop {
+        if s == "first-stage" || s == "first_stage" {
+            out.first_stage = true;
+        } else {
+            out.frags.push(s.clone());
+        }
+    }
+    out
+}
+
+/// True when `--drop` selector `sel` addresses table entry `e`: by
+/// fragment type (`platform`, `dlkm`, `recovery`, `none`) or by the table
+/// name (`16K`, `recovery`, ...). Matching is case-sensitive.
+fn frag_selector_matches(sel: &str, e: &RamdiskEntry) -> bool {
+    sel == type_name(e.entry_type) || *sel == e.name_str()
+}
+
+fn frag_dropped(set: &DropSet, e: &RamdiskEntry) -> bool {
+    set.frags.iter().any(|s| frag_selector_matches(s, e))
+}
+
 /// A fully sectioned vendor_boot image.
 pub struct Image {
     pub hdr: Header,
@@ -31,6 +94,9 @@ pub struct Image {
     pub dtb: Vec<u8>,
     pub table: Vec<RamdiskEntry>,
     pub bootconfig: Vec<u8>,
+    /// Trailing bytes after bootconfig (vbmeta + AVB footer on partition
+    /// dumps, zeros on padded dumps): carried through verbatim.
+    pub footer: Vec<u8>,
 }
 
 /// Per-fragment analysis result.
@@ -131,6 +197,9 @@ impl Image {
             dtb: bytes[dtb_start..dtb_end].to_vec(),
             table,
             bootconfig: bytes[bootconfig_off..bootconfig_end].to_vec(),
+            // Footer starts at the padded image end (assemble re-pads, so
+            // slicing from bootconfig_end would duplicate the pad bytes).
+            footer: bytes[align_up(bootconfig_end, page).min(bytes.len())..].to_vec(),
         })
     }
 
@@ -211,11 +280,7 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
                 declared_offset: f.offset,
                 available: f.size as usize,
                 valid: f.valid,
-                stored_format: match f.kind {
-                    BlobKind::Lz4Legacy => "lz4_legacy".to_string(),
-                    BlobKind::Cpio => "cpio".to_string(),
-                    BlobKind::Unknown => "unknown".to_string(),
-                },
+                stored_format: f.kind.name().to_string(),
                 entries,
                 why: if f.valid {
                     "ok".to_string()
@@ -382,11 +447,7 @@ pub fn diagnose(bytes: &[u8]) -> Diagnosis {
             declared_offset: e.offset,
             available: have,
             valid: valid && have == want,
-            stored_format: match kind {
-                BlobKind::Lz4Legacy => "lz4_legacy".to_string(),
-                BlobKind::Cpio => "cpio".to_string(),
-                BlobKind::Unknown => "unknown".to_string(),
-            },
+            stored_format: kind.name().to_string(),
             entries,
             why,
         });
@@ -473,7 +534,28 @@ fn check_fragment(blob: &[u8]) -> (BlobKind, bool, String, Option<Vec<u8>>) {
             Ok(n) => (BlobKind::Cpio, true, format!("raw cpio with {n} entries"), None),
             Err(e) => (BlobKind::Cpio, false, format!("raw cpio bad: {e}"), None),
         },
-        BlobKind::Unknown => (BlobKind::Unknown, false, "unknown fragment format".to_string(), None),
+        // Anything else: try the shared codecs (gzip/xz/lzma/lz4-frame).
+        _ => {
+            let kind = match codec::sniff(blob) {
+                Format::Gzip => BlobKind::Gzip,
+                Format::Xz => BlobKind::Xz,
+                Format::Lzma => BlobKind::Lzma,
+                Format::Lz4Frame => BlobKind::Lz4Frame,
+                _ => return (BlobKind::Unknown, false, "unknown fragment format".to_string(), None),
+            };
+            match codec::decompress(codec::sniff(blob), blob) {
+                Ok(dec) => match cpio::verify_blob(&dec) {
+                    Ok(n) => (
+                        kind,
+                        true,
+                        format!("{} decompresses to cpio with {n} entries", kind.name()),
+                        Some(dec),
+                    ),
+                    Err(e) => (kind, false, format!("{} ok but cpio bad: {e}", kind.name()), None),
+                },
+                Err(e) => (kind, false, format!("{} decompress fails: {e}", kind.name()), None),
+            }
+        }
     }
 }
 
@@ -529,7 +611,8 @@ pub fn analyze(img: &[u8]) -> Result<Analysis> {
 }
 
 /// Normalize a user-supplied platform file into raw fragment bytes:
-/// lz4-legacy stays verbatim (after validation), raw cpio gets compressed.
+/// already-compressed blobs (lz4-legacy, gzip, xz, lzma, lz4-frame) stay
+/// verbatim after validation, raw cpio gets compressed to lz4-legacy.
 fn normalize_input(path: &str, data: &[u8]) -> Result<Vec<u8>> {
     match lz4legacy::sniff(data) {
         BlobKind::Lz4Legacy => {
@@ -547,14 +630,34 @@ fn normalize_input(path: &str, data: &[u8]) -> Result<Vec<u8>> {
             })?;
             Ok(lz4legacy::compress_legacy(data))
         }
-        BlobKind::Unknown => Err(Error::Parse(format!(
-            "platform file {path}: neither lz4-legacy nor cpio (need platform.cpio or platform.cpio.lz4)"
-        ))),
+        _ => match codec::sniff(data) {
+            Format::Gzip | Format::Xz | Format::Lzma | Format::Lz4Frame => {
+                let fmt = codec::sniff(data);
+                let dec = codec::decompress(fmt, data).map_err(|e| {
+                    Error::Parse(format!("platform file {path} is broken {}: {e}", fmt.name()))
+                })?;
+                cpio::verify_blob(&dec).map_err(|e| {
+                    Error::Parse(format!("platform file {path} decompresses but cpio is bad: {e}"))
+                })?;
+                Ok(data.to_vec())
+            }
+            _ => Err(Error::Parse(format!(
+                "platform file {path}: neither lz4-legacy, cpio, gzip, xz, lzma nor lz4 (need platform.cpio or a compressed ramdisk)"
+            ))),
+        },
     }
 }
 
-/// Assemble an image from a header template + fragments + dtb + bootconfig.
-pub(crate) fn assemble(hdr: &Header, frags: &[Vec<u8>], entries: &[RamdiskEntry], dtb: &[u8], bootconfig: &[u8]) -> Vec<u8> {
+/// Assemble an image from a header template + fragments + dtb + bootconfig
+/// + footer (footer goes last, unpadded, exactly like partition dumps).
+pub(crate) fn assemble(
+    hdr: &Header,
+    frags: &[Vec<u8>],
+    entries: &[RamdiskEntry],
+    dtb: &[u8],
+    bootconfig: &[u8],
+    footer: &[u8],
+) -> Vec<u8> {
     let page = hdr.page_size as usize;
     let mut out = Vec::new();
     let h = hdr.serialize();
@@ -572,12 +675,18 @@ pub(crate) fn assemble(hdr: &Header, frags: &[Vec<u8>], entries: &[RamdiskEntry]
     out.extend_from_slice(&vec![0u8; (align_up(out.len(), page) - out.len()) % page.max(1)]);
     out.extend_from_slice(bootconfig);
     out.extend_from_slice(&vec![0u8; (align_up(out.len(), page) - out.len()) % page.max(1)]);
+    out.extend_from_slice(footer);
     out
 }
 
 /// Verify a freshly assembled image fully in memory before emitting.
 pub fn verify_image(bytes: &[u8]) -> Result<()> {
     let im = Image::load(bytes).map_err(|e| Error::Verify(format!("rebuilt image does not parse: {e}")))?;
+    if im.table.is_empty() {
+        return Err(Error::Verify(
+            "rebuilt image has no ramdisk fragments, refusing to emit an empty image".to_string(),
+        ));
+    }
     let mut sum: u64 = 0;
     let mut running: u64 = 0;
     for (i, e) in im.table.iter().enumerate() {
@@ -606,7 +715,8 @@ pub fn verify_image(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Decompress one fragment blob (lz4-legacy or raw cpio) into entries.
+/// Decompress one fragment blob (lz4-legacy, raw cpio or another supported
+/// codec) into entries.
 fn blob_entries(blob: &[u8]) -> Result<Vec<Entry>> {
     match lz4legacy::sniff(blob) {
         BlobKind::Lz4Legacy => {
@@ -614,18 +724,59 @@ fn blob_entries(blob: &[u8]) -> Result<Vec<Entry>> {
             cpio::parse(&dec)
         }
         BlobKind::Cpio => cpio::parse(blob),
-        BlobKind::Unknown => Err(Error::Parse("fragment is neither lz4-legacy nor cpio".to_string())),
+        _ => match codec::sniff(blob) {
+            Format::Gzip | Format::Xz | Format::Lzma | Format::Lz4Frame => {
+                let dec = codec::decompress(codec::sniff(blob), blob)?;
+                cpio::parse(&dec)
+            }
+            _ => Err(Error::Parse(
+                "fragment is in an unsupported format (need lz4-legacy, cpio, gzip, xz, lzma or lz4)"
+                    .to_string(),
+            )),
+        },
     }
 }
 
-/// Entries of every valid original fragment, plus a flag telling whether
-/// the table as a whole is trustworthy (chained offsets, matching sum).
+/// Entries of every kept original fragment, plus a flag telling whether
+/// the kept set is usable per-fragment. With no `--drop` selector this is
+/// exactly the old behavior (chained absolute offsets, matching sum);
+/// with dropped fragments the survivors are judged on their own (each
+/// readable — offsets still address the original blob, so chaining
+/// against removed neighbors is meaningless).
 struct OrigContent {
     frags: Vec<(RamdiskEntry, Vec<Entry>)>,
     table_ok: bool,
 }
 
-fn orig_content(im: &Image) -> OrigContent {
+fn orig_content(im: &Image, kept: &[bool]) -> OrigContent {
+    let full = kept.len() == im.table.len() && kept.iter().all(|&k| k);
+    if !full {
+        let mut frags = Vec::new();
+        let mut ok = false;
+        for (i, e) in im.table.iter().enumerate() {
+            if !kept.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            match im.frag_bytes(i).and_then(blob_entries) {
+                Ok(en) => {
+                    ok = true;
+                    frags.push((e.clone(), en));
+                }
+                Err(_) => {
+                    // Mirror the all-or-nothing rule below: one unreadable
+                    // survivor poisons the per-fragment view (the rescue
+                    // path warns that fragment selectors do not apply).
+                    frags.clear();
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !kept.iter().any(|&k| k) {
+            ok = false;
+        }
+        return OrigContent { frags, table_ok: ok };
+    }
     let mut frags = Vec::new();
     let mut ok = !im.table.is_empty();
     let mut run: u64 = 0;
@@ -657,8 +808,189 @@ fn whole_blob_entries(im: &Image) -> Result<Vec<Entry>> {
         .map_err(|e| Error::Parse(format!("content unusable per-fragment and not one stream: {e}")))
 }
 
+/// Inbuild first-stage entries: `first_stage_ramdisk/**` from the readable
+/// original platform fragments (whole-blob rescue when the table is
+/// stale). Dropped fragments never contribute.
+fn base_first_stage(im: &Image, kept: &[bool], use_frags: bool) -> Vec<Entry> {
+    let mut pool = Vec::new();
+    if use_frags {
+        for (i, e) in im.table.iter().enumerate() {
+            if !kept.get(i).copied().unwrap_or(false) || e.entry_type != TYPE_PLATFORM {
+                continue;
+            }
+            if let Ok(en) = im.frag_bytes(i).and_then(blob_entries) {
+                pool.extend(en);
+            }
+        }
+    } else if let Ok(en) = whole_blob_entries(im) {
+        pool = en;
+    }
+    pool.into_iter()
+        .filter(|e| cpio::is_first_stage_path(&cpio::name_str(e)))
+        .collect()
+}
+
+/// Split entries into (non-first-stage, dropped-first-stage-count).
+fn strip_first_stage(entries: Vec<Entry>) -> (Vec<Entry>, usize) {
+    let before = entries.len();
+    let kept: Vec<Entry> = entries
+        .into_iter()
+        .filter(|e| !cpio::is_first_stage_path(&cpio::name_str(e)))
+        .collect();
+    let n = before - kept.len();
+    (kept, n)
+}
+
+/// First-stage rule for a passed platform cpio (`new_entries`).
+/// Default: the base image's own first-stage (inbuild) wins — those
+/// entries go first, the cpio's first-stage entries are dropped along the
+/// way. With `first-stage` in `--drop` the rule inverts: the cpio is used
+/// as-is and the inbuild first-stage is dropped.
+/// Returns the entries plus whether they were rebuilt (the caller must
+/// re-encode instead of reusing the passed bytes verbatim).
+fn apply_first_stage(
+    im: &Image,
+    kept: &[bool],
+    use_frags: bool,
+    drops: &DropSet,
+    label: &str,
+    new_entries: Vec<Entry>,
+) -> (Vec<Entry>, bool) {
+    let new_fs =
+        new_entries.iter().filter(|e| cpio::is_first_stage_path(&cpio::name_str(e))).count();
+    if drops.first_stage {
+        if new_fs == 0 {
+            eprintln!(
+                "warning: inbuild first-stage dropped (--drop first-stage) but {label} has none; result platform has no first-stage"
+            );
+        }
+        return (new_entries, false);
+    }
+    let base_fs = base_first_stage(im, kept, use_frags);
+    if base_fs.is_empty() {
+        eprintln!("warning: no readable inbuild first-stage, using {label} as-is");
+        return (new_entries, false);
+    }
+    let (stripped, n) = strip_first_stage(new_entries);
+    if n > 0 {
+        eprintln!(
+            "kept inbuild first-stage ({} entries), dropped {n} first-stage entries from {label}",
+            base_fs.len()
+        );
+    } else {
+        eprintln!("kept inbuild first-stage ({} entries), {label} has none", base_fs.len());
+    }
+    let mut out = base_fs;
+    out.extend(stripped);
+    (out, true)
+}
+
+fn parse_u32(v: &str, key: &str) -> Result<u32> {
+    let t = v.trim();
+    let (radix, digits) = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, h)
+    } else {
+        (10, t)
+    };
+    u32::from_str_radix(digits, radix)
+        .map_err(|_| Error::Usage(format!("--set {key} needs an integer, got '{v}'")))
+}
+
+fn parse_u64(v: &str, key: &str) -> Result<u64> {
+    let t = v.trim();
+    let (radix, digits) = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, h)
+    } else {
+        (10, t)
+    };
+    u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::Usage(format!("--set {key} needs an integer, got '{v}'")))
+}
+
+fn fixed_bytes(b: &[u8], len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let n = b.len().min(len);
+    out[..n].copy_from_slice(&b[..n]);
+    out
+}
+
+/// Apply `--set k=v` header overrides (vendor_boot key set, same as the
+/// repack subprogram). Runs after the layout is decided, so it cannot
+/// break offsets — except page_size, which re-lays the whole image out
+/// (assemble aligns by it, verify confirms the result).
+fn apply_sets(hdr: &mut Header, sets: &[(String, String)]) -> Result<()> {
+    for (k, v) in sets {
+        match k.as_str() {
+            "cmdline" => hdr.cmdline = fixed_bytes(v.as_bytes(), 2048).try_into().unwrap(),
+            "name" => hdr.name = fixed_bytes(v.as_bytes(), 16).try_into().unwrap(),
+            "page_size" => hdr.page_size = parse_u32(v, k)?,
+            "kernel_addr" => hdr.kernel_addr = parse_u32(v, k)?,
+            "ramdisk_addr" => hdr.ramdisk_addr = parse_u32(v, k)?,
+            "tags_addr" => hdr.tags_addr = parse_u32(v, k)?,
+            "dtb_addr" => hdr.dtb_addr = parse_u64(v, k)?,
+            "os_version" | "os_patch_level" => {
+                return Err(Error::Usage(format!("--set {k} is boot-only (vendor_boot has no os_version)")))
+            }
+            _ => return Err(Error::Usage(format!("--set: unknown key '{k}'"))),
+        }
+    }
+    Ok(())
+}
+
+/// Rechain offsets over a fragment set (needed when `--drop` removed
+/// entries: survivors keep their bytes, offsets close ranks).
+fn rechain(frags: Vec<Vec<u8>>, mut table: Vec<RamdiskEntry>) -> (Vec<Vec<u8>>, Vec<RamdiskEntry>) {
+    let mut off: u64 = 0;
+    for (raw, e) in frags.iter().zip(table.iter_mut()) {
+        e.offset = off as u32;
+        e.size = raw.len() as u32;
+        off += raw.len() as u64;
+    }
+    (frags, table)
+}
+
+/// Drop first-stage entries out of platform fragments, re-encoding them
+/// marker-free. Non-platform fragments pass through verbatim.
+fn strip_platforms(
+    frags: Vec<Vec<u8>>,
+    table: Vec<RamdiskEntry>,
+) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
+    let mut f = Vec::with_capacity(frags.len());
+    let mut t = Vec::with_capacity(table.len());
+    for (raw, e) in frags.into_iter().zip(table) {
+        if e.entry_type == TYPE_PLATFORM {
+            let (stripped, n) = strip_first_stage(blob_entries(&raw)?);
+            if n > 0 {
+                eprintln!("dropped {n} first-stage entries from a platform fragment (--drop first-stage)");
+            }
+            f.push(lz4legacy::compress_legacy(&cpio::build(&stripped)));
+        } else {
+            f.push(raw);
+        }
+        t.push(e);
+    }
+    Ok(rechain(f, t))
+}
+
+/// board_id of the first kept original fragment of `etype` (zeros when
+/// none): freshly encoded fragments inherit it so re-encoded tables keep
+/// the device binding instead of zeroing it out.
+fn board_id_of(im: &Image, kept: &[bool], etype: u32) -> [u8; 64] {
+    im.table
+        .iter()
+        .enumerate()
+        .find(|(i, e)| e.entry_type == etype && kept.get(*i).copied().unwrap_or(false))
+        .map(|(_, e)| e.board_id)
+        .unwrap_or([0u8; 64])
+}
+
 /// Raw bytes + table entry for one freshly encoded fragment.
-fn encode_fragment(entries: &[Entry], etype: u32, offset: u32) -> (Vec<u8>, RamdiskEntry) {
+fn encode_fragment(
+    entries: &[Entry],
+    etype: u32,
+    offset: u32,
+    board_id: [u8; 64],
+) -> (Vec<u8>, RamdiskEntry) {
     let raw = lz4legacy::compress_legacy(&cpio::build(entries));
     let mut entry = match etype {
         TYPE_DLKM => RamdiskEntry::dlkm(0, 0),
@@ -671,15 +1003,19 @@ fn encode_fragment(entries: &[Entry], etype: u32, offset: u32) -> (Vec<u8>, Ramd
     };
     entry.size = raw.len() as u32;
     entry.offset = offset;
+    entry.board_id = board_id;
     (raw, entry)
 }
 
 /// Build platform/recovery/dlkm fragments from an entry pool.
-/// `verbatim_dlkm`: valid original dlkm bytes, used only when the pool
-/// yields no dlkm payload of its own.
+/// `verbatim_dlkm`: valid original dlkm (entry + bytes), used only when
+/// the pool yields no dlkm payload of its own. Fresh entries inherit the
+/// board_id of the kept originals of the same type.
 fn split_entries(
     entries: Vec<Entry>,
-    verbatim_dlkm: Option<Vec<u8>>,
+    verbatim_dlkm: Option<(RamdiskEntry, Vec<u8>)>,
+    im: &Image,
+    kept: &[bool],
 ) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
     let (plat, rec, dlkm) = cpio::partition(&entries);
     if plat.is_empty() {
@@ -689,22 +1025,23 @@ fn split_entries(
     }
     let mut frags = Vec::new();
     let mut table = Vec::new();
-    let (plat_raw, e0) = encode_fragment(&plat, TYPE_PLATFORM, 0);
+    let (plat_raw, e0) = encode_fragment(&plat, TYPE_PLATFORM, 0, board_id_of(im, kept, TYPE_PLATFORM));
     let mut off = plat_raw.len() as u32;
     frags.push(plat_raw);
     table.push(e0);
     if cpio::has_payload(&rec) {
-        let (rec_raw, e) = encode_fragment(&rec, TYPE_RECOVERY, off);
+        let (rec_raw, e) = encode_fragment(&rec, TYPE_RECOVERY, off, board_id_of(im, kept, TYPE_RECOVERY));
         off += rec_raw.len() as u32;
         frags.push(rec_raw);
         table.push(e);
     }
     if cpio::has_payload(&dlkm) {
-        let (dlkm_raw, e) = encode_fragment(&dlkm, TYPE_DLKM, off);
+        let (dlkm_raw, e) = encode_fragment(&dlkm, TYPE_DLKM, off, board_id_of(im, kept, TYPE_DLKM));
         frags.push(dlkm_raw);
         table.push(e);
-    } else if let Some(raw) = verbatim_dlkm {
-        let e = RamdiskEntry::dlkm(raw.len() as u32, off);
+    } else if let Some((mut e, raw)) = verbatim_dlkm {
+        e.offset = off;
+        e.size = raw.len() as u32;
         frags.push(raw);
         table.push(e);
     }
@@ -717,11 +1054,15 @@ fn split_entries(
 /// This is what keeps foreign fragments like shiba's "16K" (type none,
 /// 16K-page kernel modules) or a recovery fragment alive across a
 /// platform swap instead of silently dropping 17 MB of modules.
-/// Unreadable originals are skipped with a stderr note, never propagated.
-fn carryovers(im: &Image, produced: &[(u32, String)]) -> Vec<(RamdiskEntry, Vec<u8>)> {
+/// Fragments named in `--drop` are skipped; unreadable originals are
+/// skipped with a stderr note, never propagated.
+fn carryovers(im: &Image, produced: &[(u32, String)], kept: &[bool]) -> Vec<(RamdiskEntry, Vec<u8>)> {
     let mut out = Vec::new();
     for (i, e) in im.table.iter().enumerate() {
         if e.entry_type == TYPE_PLATFORM {
+            continue;
+        }
+        if !kept.get(i).copied().unwrap_or(false) {
             continue;
         }
         if produced.iter().any(|(t, n)| *t == e.entry_type && *n == e.name_str()) {
@@ -750,9 +1091,10 @@ fn append_carryovers(
     table: &mut Vec<RamdiskEntry>,
     im: &Image,
     produced: &[(u32, String)],
+    kept: &[bool],
 ) {
     let mut off: u32 = frags.iter().map(|f| f.len() as u32).sum();
-    for (mut e, raw) in carryovers(im, produced) {
+    for (mut e, raw) in carryovers(im, produced, kept) {
         e.offset = off;
         off += raw.len() as u32;
         eprintln!(
@@ -766,24 +1108,231 @@ fn append_carryovers(
     }
 }
 
+/// Recovery-install layout for `--recovery <fox>`: detach the vendor blobs
+/// from recovery and install the passed ramdisk as the recovery fragment.
+///
+/// Output fragments, in order:
+/// - platform = native `first_stage_ramdisk/**` entries ONLY, harvested
+///   from the whole kept pool (wherever they live). The harvest happens
+///   BEFORE the old recovery is dropped, so an old recovery holding
+///   first-stage can never brick the device when it is replaced.
+/// - recovery = the passed file minus first-stage duplicates (verbatim
+///   bytes when it has none, re-encoded otherwise).
+/// - dlkm = a valid original dlkm verbatim; else `lib/**` pulled out of
+///   the pool into a fresh dlkm; else nothing.
+/// - any other valid original non-platform fragment (16K, ...) carries
+///   over verbatim. Old recovery-type originals are always replaced,
+///   never carried over.
+///
+/// Refuses (exit 2 through the CLI) when the kept base has no first-stage
+/// (the platform would be empty) or the fox file yields no recovery
+/// payload.
+fn build_recovery(
+    im: &Image,
+    kept: &[bool],
+    drops: &DropSet,
+    orig: &OrigContent,
+    orig_valid_dlkm: Option<(RamdiskEntry, Vec<u8>)>,
+    label: &str,
+    data: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
+    // Entry pool: per-fragment when the kept set is usable, whole-blob
+    // rescue otherwise (stale-table base). attributed with its fragment
+    // type so first-stage sources can be reported.
+    let src: Vec<(u32, Vec<Entry>)> = if orig.table_ok {
+        orig.frags.iter().map(|(e, en)| (e.entry_type, en.clone())).collect()
+    } else {
+        if !drops.frags.is_empty() {
+            eprintln!(
+                "warning: table unusable, --drop fragment selectors have no effect on whole-blob rescue"
+            );
+        }
+        vec![(TYPE_PLATFORM, whole_blob_entries(im)?)]
+    };
+    let mut pool: Vec<Entry> = Vec::new();
+    let mut fs_entries: Vec<Entry> = Vec::new();
+    let (mut fs_plat, mut fs_other) = (0usize, 0usize);
+    for (etype, en) in &src {
+        for e in en {
+            if cpio::name_str(e) == "TRAILER!!!" {
+                continue;
+            }
+            pool.push(e.clone());
+            if cpio::is_first_stage_path(&cpio::name_str(e)) {
+                if *etype == TYPE_PLATFORM {
+                    fs_plat += 1;
+                } else {
+                    fs_other += 1;
+                }
+                fs_entries.push(e.clone());
+            }
+        }
+    }
+    if drops.first_stage {
+        let (stripped, n) = strip_first_stage(fs_entries);
+        if n > 0 {
+            eprintln!("dropped {n} first-stage entries from the base pool (--drop first-stage)");
+        }
+        fs_entries = stripped;
+    }
+    if fs_entries.is_empty() {
+        return Err(Error::Parse(
+            "refusing recovery install: no first_stage_ramdisk/** in the kept base content (platform would be empty)".to_string(),
+        ));
+    }
+    eprintln!(
+        "first-stage: {} entries ({} from platform, {} from other fragments) -> new platform",
+        fs_entries.len(),
+        fs_plat,
+        fs_other,
+    );
+    if fs_other > 0 {
+        eprintln!(
+            "warning: first-stage harvested from non-platform fragments (old recovery); it moves to platform so replacing recovery stays safe"
+        );
+    }
+    // Recovery payload: validated like a platform file (compressed stays
+    // verbatim, raw cpio gets compressed), first-stage duplicates out.
+    let fox_raw = normalize_input(label, data)?;
+    let fox_entries = blob_entries(&fox_raw)
+        .map_err(|e| Error::Parse(format!("internal error re-reading recovery file: {e}")))?;
+    let (fox_stripped, n) = strip_first_stage(fox_entries);
+    if n > 0 {
+        eprintln!("dropped {n} first-stage duplicates from {label} (inbuild first-stage wins)");
+    }
+    let fox_rec = cpio::drop_trailers(&fox_stripped);
+    if fox_rec.is_empty() {
+        return Err(Error::Parse(format!(
+            "refusing recovery install: {label} yields no recovery payload"
+        )));
+    }
+    // Verbatim bytes when nothing was stripped, re-encoded otherwise.
+    let fox_bytes =
+        if n == 0 { fox_raw } else { lz4legacy::compress_legacy(&cpio::build(&fox_rec)) };
+    // board_id: first original recovery entry's, else the platform's.
+    let rec_bid = im
+        .table
+        .iter()
+        .find(|e| e.entry_type == TYPE_RECOVERY)
+        .map(|e| e.board_id)
+        .unwrap_or_else(|| board_id_of(im, kept, TYPE_PLATFORM));
+    let mut frags: Vec<Vec<u8>> = Vec::new();
+    let mut table: Vec<RamdiskEntry> = Vec::new();
+    let (plat_raw, e0) = encode_fragment(&fs_entries, TYPE_PLATFORM, 0, board_id_of(im, kept, TYPE_PLATFORM));
+    let mut off = plat_raw.len() as u32;
+    eprintln!("platform: {} first-stage entries ({} bytes)", fs_entries.len(), plat_raw.len());
+    frags.push(plat_raw);
+    table.push(e0);
+    let mut er_name = [0u8; 32];
+    er_name[0..8].copy_from_slice(b"recovery");
+    let er = RamdiskEntry {
+        size: fox_bytes.len() as u32,
+        offset: off,
+        entry_type: TYPE_RECOVERY,
+        name: er_name,
+        board_id: rec_bid,
+    };
+    off += fox_bytes.len() as u32;
+    eprintln!("recovery: {} entries from {label} ({} bytes)", fox_rec.len(), fox_bytes.len());
+    frags.push(fox_bytes);
+    table.push(er);
+    // produced[] tracks (type, name) for the carryover filter; every kept
+    // original recovery fragment is listed so none survives the replace.
+    let mut produced: Vec<(u32, String)> = vec![(TYPE_PLATFORM, String::new())];
+    for (i, e) in im.table.iter().enumerate() {
+        if e.entry_type == TYPE_RECOVERY && kept.get(i).copied().unwrap_or(false) {
+            produced.push((TYPE_RECOVERY, e.name_str()));
+        }
+    }
+    let (_, _, pool_lib) = cpio::partition(&pool);
+    if let Some((mut e, raw)) = orig_valid_dlkm {
+        e.offset = off;
+        e.size = raw.len() as u32;
+        eprintln!("dlkm: kept original {:?} verbatim ({} bytes)", e.name_str(), raw.len());
+        frags.push(raw);
+        table.push(e.clone());
+        produced.push((TYPE_DLKM, e.name_str()));
+    } else if cpio::has_payload(&pool_lib) {
+        let (dlkm_raw, e) = encode_fragment(&pool_lib, TYPE_DLKM, off, board_id_of(im, kept, TYPE_DLKM));
+        let n_lib = pool_lib.iter().filter(|e| cpio::name_str(e) != "TRAILER!!!").count();
+        eprintln!("dlkm: pulled {n_lib} lib/** entries out of the base pool ({} bytes)", dlkm_raw.len());
+        frags.push(dlkm_raw);
+        table.push(e);
+        produced.push((TYPE_DLKM, "dlkm".to_string()));
+    } else if pool.iter().any(|e| cpio::is_dlkm_path(&cpio::name_str(e))) {
+        eprintln!("note: base pool holds lib/** dir entries only (no payload), no dlkm emitted");
+    }
+    append_carryovers(&mut frags, &mut table, im, &produced, kept);
+    Ok((frags, table))
+}
+
 /// Main repack routine.
 ///
 /// - `platform`: optional (path label, bytes) replacement content.
 /// - `mode`: Keep (round-trip verbatim / normalize stale table),
 ///   Split (partition into platform/recovery/dlkm by subtree),
 ///   Merge (glue everything into one platform fragment).
+/// - `drop` (`RepackOpts::drop`): `--drop` selectors — original fragments
+///   matched by table type or name are left out in every mode (Keep
+///   skips them and rechains, Split/Merge exclude them from the pool,
+///   carryover and the verbatim dlkm fallback); the special `first-stage`
+///   inverts the first-stage rule (see [`apply_first_stage`).
+/// - `recovery` (`RepackOpts::recovery`): `--recovery <file>` payload —
+///   recovery-install layout (see [`build_recovery`]); conflicts with a
+///   platform file and with Split/Merge.
+/// No-drop shorthand over [`repack_with_opts`] (kept for callers that
+/// only select a layout mode).
+#[allow(dead_code)]
 pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) -> Result<Vec<u8>> {
+    repack_with_opts(
+        orig_bytes,
+        platform,
+        RepackOpts { mode, drop: Vec::new(), sets: Vec::new(), recovery: None, drop_footer: false },
+    )
+}
+
+pub fn repack_with_opts(
+    orig_bytes: &[u8],
+    platform: Option<(&str, Vec<u8>)>,
+    opts: RepackOpts,
+) -> Result<Vec<u8>> {
+    let mode = opts.mode;
     let im = Image::load(orig_bytes)?;
-    let orig = orig_content(&im);
-    let orig_valid_dlkm_raw: Option<Vec<u8>> = {
+    let drops = parse_drop(&opts.drop);
+    let kept: Vec<bool> = im.table.iter().map(|e| !frag_dropped(&drops, e)).collect();
+    for s in &drops.frags {
+        if !im.table.iter().any(|e| frag_selector_matches(s, e)) {
+            eprintln!("warning: --drop {s}: matched no fragment, ignored");
+        }
+    }
+    if !im.table.is_empty() && !kept.iter().any(|&k| k) {
+        return Err(Error::Usage(
+            "--drop removes every fragment, nothing left to build".to_string(),
+        ));
+    }
+    // Whole-blob rescue cannot honor fragment selectors (there are no
+    // fragment boundaries in a single stream): warn when it is taken.
+    let rescue_note = || {
+        if !drops.frags.is_empty() {
+            eprintln!(
+                "warning: table unusable, --drop fragment selectors have no effect on whole-blob rescue"
+            );
+        }
+    };
+    let orig = orig_content(&im, &kept);
+    // Valid original dlkm as (entry, bytes) fallback: the entry carries
+    // the original board_id/name, the caller only refreshes offset/size.
+    let orig_valid_dlkm: Option<(RamdiskEntry, Vec<u8>)> = {
         let mut out = None;
         for (i, e) in im.table.iter().enumerate() {
-            if e.entry_type != TYPE_DLKM {
+            if e.entry_type != TYPE_DLKM || !kept.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if let Ok(b) = im.frag_bytes(i) {
                 if check_fragment(b).1 {
-                    out = Some(b.to_vec());
+                    let mut ne = e.clone();
+                    ne.size = b.len() as u32;
+                    out = Some((ne, b.to_vec()));
                 }
             }
         }
@@ -791,13 +1340,22 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
     };
 
     // Entry pool for Split/Merge without a platform file: per-fragment
-    // content when the table is trustworthy, whole-blob rescue otherwise.
+    // content when the kept set is usable, whole-blob rescue otherwise.
     let pooled_all = || -> Result<Vec<Entry>> {
-        if orig.table_ok {
-            Ok(orig.frags.iter().flat_map(|(_, en)| en.clone()).collect())
+        let mut en = if orig.table_ok {
+            orig.frags.iter().flat_map(|(_, en)| en.clone()).collect()
         } else {
-            whole_blob_entries(&im)
+            rescue_note();
+            whole_blob_entries(&im)?
+        };
+        if drops.first_stage {
+            let (stripped, n) = strip_first_stage(en);
+            if n > 0 {
+                eprintln!("dropped {n} first-stage entries from the pool (--drop first-stage)");
+            }
+            en = stripped;
         }
+        Ok(en)
     };
     // Valid non-platform original entries (dlkm/recovery) for the Merge
     // union. Unreadable ones are skipped with a stderr note: Merge must
@@ -805,7 +1363,7 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
     let pooled_non_platform = || -> Vec<Entry> {
         let mut out = Vec::new();
         for (i, e) in im.table.iter().enumerate() {
-            if e.entry_type == TYPE_PLATFORM {
+            if e.entry_type == TYPE_PLATFORM || !kept.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if let Ok(b) = im.frag_bytes(i) {
@@ -821,53 +1379,95 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
         out
     };
 
-    let (new_frags_raw, new_entries) = match (platform, mode) {
+    let (new_frags_raw, new_entries) = if let Some((label, data)) = &opts.recovery {
+        if platform.is_some() {
+            return Err(Error::Usage(
+                "--recovery conflicts with a platform file (pick one replacement)".to_string(),
+            ));
+        }
+        if mode != Mode::Keep {
+            return Err(Error::Usage(
+                "--recovery conflicts with --split-first-stage/--merge".to_string(),
+            ));
+        }
+        build_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, label, data)?
+    } else {
+        match (platform, mode) {
         (None, Mode::Keep) => {
             if orig.table_ok {
-                // Byte-identical round trip.
+                // Survivors round-trip verbatim, offsets rechained (with
+                // no --drop this is byte-identical to the input).
                 let mut f = Vec::new();
                 let mut t = Vec::new();
                 for (i, e) in im.table.iter().enumerate() {
+                    if !kept.get(i).copied().unwrap_or(false) {
+                        continue;
+                    }
                     f.push(im.frag_bytes(i).unwrap().to_vec());
                     t.push(e.clone());
                 }
-                (f, t)
+                let (f, t) = rechain(f, t);
+                if drops.first_stage { strip_platforms(f, t)? } else { (f, t) }
             } else {
                 // Stale-table single stream -> one platform entry over the
                 // whole verbatim blob (validated first).
-                whole_blob_entries(&im)?;
-                let e = RamdiskEntry::platform(im.ramdisk_blob.len() as u32);
-                (vec![im.ramdisk_blob.clone()], vec![e])
+                rescue_note();
+                let en = whole_blob_entries(&im)?;
+                if drops.first_stage {
+                    let (stripped, n) = strip_first_stage(en);
+                    if n > 0 {
+                        eprintln!("dropped {n} first-stage entries from whole-blob rescue (--drop first-stage)");
+                    }
+                    let (raw, e) =
+                        encode_fragment(&stripped, TYPE_PLATFORM, 0, board_id_of(&im, &kept, TYPE_PLATFORM));
+                    (vec![raw], vec![e])
+                } else {
+                    let mut e = RamdiskEntry::platform(im.ramdisk_blob.len() as u32);
+                    e.board_id = board_id_of(&im, &kept, TYPE_PLATFORM);
+                    (vec![im.ramdisk_blob.clone()], vec![e])
+                }
             }
         }
         (None, Mode::Merge) => {
             let entries = cpio::drop_trailers(&pooled_all()?);
-            let (raw, e) = encode_fragment(&entries, TYPE_PLATFORM, 0);
+            let (raw, e) = encode_fragment(&entries, TYPE_PLATFORM, 0, board_id_of(&im, &kept, TYPE_PLATFORM));
             (vec![raw], vec![e])
         }
-        (None, Mode::Split) => split_entries(pooled_all()?, None)?,
+        (None, Mode::Split) => split_entries(pooled_all()?, None, &im, &kept)?,
         (Some((label, data)), Mode::Keep) => {
             let new_plat_raw = normalize_input(label, &data)?;
             let entries = blob_entries(&new_plat_raw).map_err(|e| {
                 Error::Parse(format!("internal error re-reading new platform: {e}"))
             })?;
+            let (entries, fs_rebuilt) =
+                apply_first_stage(&im, &kept, orig.table_ok, &drops, label, entries);
+            // A rebuilt entry set cannot reuse the passed bytes verbatim.
+            let new_plat_raw = if fs_rebuilt {
+                lz4legacy::compress_legacy(&cpio::build(&cpio::drop_trailers(&entries)))
+            } else {
+                new_plat_raw
+            };
             let (plat_entries, _, lib_entries) = cpio::partition(&entries);
             let mut frags: Vec<Vec<u8>>;
             let mut table: Vec<RamdiskEntry>;
             // produced[] tracks (type, name) for the carryover filter.
             let mut produced: Vec<(u32, String)> = vec![(TYPE_PLATFORM, String::new())];
-            if let Some(dlkm_raw) = orig_valid_dlkm_raw {
+            if let Some((mut dlkm_entry, dlkm_raw)) = orig_valid_dlkm {
                 // Valid original dlkm wins as fallback; new platform keeps
-                // its own files untouched (verbatim bytes).
+                // its own files untouched (verbatim bytes). The original
+                // entry (name, board_id) is reused, offset refreshed.
                 let off = new_plat_raw.len() as u32;
-                let e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
-                let e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, off);
+                let mut e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
+                e0.board_id = board_id_of(&im, &kept, TYPE_PLATFORM);
+                dlkm_entry.offset = off;
+                dlkm_entry.size = dlkm_raw.len() as u32;
                 frags = vec![new_plat_raw, dlkm_raw];
-                table = vec![e0, e1];
+                table = vec![e0, dlkm_entry];
                 produced.push((TYPE_DLKM, "dlkm".to_string()));
             } else if !cpio::has_payload(&lib_entries) {
                 // No dlkm content anywhere: platform plus carryovers.
-                let e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
+                let mut e0 = RamdiskEntry::platform(new_plat_raw.len() as u32);
+                e0.board_id = board_id_of(&im, &kept, TYPE_PLATFORM);
                 frags = vec![new_plat_raw];
                 table = vec![e0];
             } else {
@@ -876,25 +1476,29 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
                 let dlkm_cpio = cpio::build(&lib_entries);
                 let plat_raw = lz4legacy::compress_legacy(&plat_cpio);
                 let dlkm_raw = lz4legacy::compress_legacy(&dlkm_cpio);
-                let e0 = RamdiskEntry::platform(plat_raw.len() as u32);
-                let e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, plat_raw.len() as u32);
+                let mut e0 = RamdiskEntry::platform(plat_raw.len() as u32);
+                e0.board_id = board_id_of(&im, &kept, TYPE_PLATFORM);
+                let mut e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, plat_raw.len() as u32);
+                e1.board_id = board_id_of(&im, &kept, TYPE_DLKM);
                 frags = vec![plat_raw, dlkm_raw];
                 table = vec![e0, e1];
                 produced.push((TYPE_DLKM, "dlkm".to_string()));
             }
-            append_carryovers(&mut frags, &mut table, &im, &produced);
+            append_carryovers(&mut frags, &mut table, &im, &produced, &kept);
             (frags, table)
         }
         (Some((label, data)), Mode::Merge) => {
             let new_plat_raw = normalize_input(label, &data)?;
-            let mut entries = blob_entries(&new_plat_raw).map_err(|e| {
+            let entries = blob_entries(&new_plat_raw).map_err(|e| {
                 Error::Parse(format!("internal error re-reading new platform: {e}"))
             })?;
+            let (mut entries, _) = apply_first_stage(&im, &kept, orig.table_ok, &drops, label, entries);
             // Platform slots are replaced; non-platform original content
             // (dlkm/recovery) joins the single fragment.
             entries.extend(pooled_non_platform());
             let entries = cpio::drop_trailers(&entries);
-            let (raw, e) = encode_fragment(&entries, TYPE_PLATFORM, 0);
+            let (raw, e) =
+                encode_fragment(&entries, TYPE_PLATFORM, 0, board_id_of(&im, &kept, TYPE_PLATFORM));
             (vec![raw], vec![e])
         }
         (Some((label, data)), Mode::Split) => {
@@ -902,15 +1506,18 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
             let entries = blob_entries(&new_plat_raw).map_err(|e| {
                 Error::Parse(format!("internal error re-reading new platform: {e}"))
             })?;
+            let (entries, _) = apply_first_stage(&im, &kept, orig.table_ok, &drops, label, entries);
             // Verbatim fallback: if the new content yields no dlkm payload
-            // but the original dlkm is valid, keep it byte-identically.
+            // but the original dlkm is valid, keep it byte-identically
+            // (entry included, so name/board_id survive).
             let (_, _, lib_check) = cpio::partition(&entries);
-            let fallback = if cpio::has_payload(&lib_check) { None } else { orig_valid_dlkm_raw };
-            let (mut frags, mut table) = split_entries(entries, fallback)?;
+            let fallback = if cpio::has_payload(&lib_check) { None } else { orig_valid_dlkm };
+            let (mut frags, mut table) = split_entries(entries, fallback, &im, &kept)?;
             let produced: Vec<(u32, String)> =
                 table.iter().map(|e| (e.entry_type, e.name_str())).collect();
-            append_carryovers(&mut frags, &mut table, &im, &produced);
+            append_carryovers(&mut frags, &mut table, &im, &produced, &kept);
             (frags, table)
+        }
         }
     };
 
@@ -920,10 +1527,18 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
     }
     let mut hdr = im.hdr.clone();
     hdr.ramdisk_size = ramdisk_size as u32;
+    apply_sets(&mut hdr, &opts.sets)?;
     hdr.table_entry_num = new_entries.len() as u32;
     hdr.table_entry_size = 108;
     hdr.table_size = (new_entries.len() as u32) * 108;
-    let out = assemble(&hdr, &new_frags_raw, &new_entries, &im.dtb, &im.bootconfig);
+    let out = assemble(
+        &hdr,
+        &new_frags_raw,
+        &new_entries,
+        &im.dtb,
+        &im.bootconfig,
+        if opts.drop_footer { b"" } else { &im.footer },
+    );
     verify_image(&out).map_err(|e| Error::Verify(format!("refusing to emit invalid image: {e}")))?;
     Ok(out)
 }

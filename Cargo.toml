@@ -17,6 +17,9 @@ flate2 = "1"
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "xz"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.9"
+# Arrow-key menus for the `pick` subprogram (installer UX).
+# Core Select only: default-features off drops editor/password/fuzzy.
+dialoguer = { version = "0.12", default-features = false }
 
 # statvfs binding for the pre-write free-space check (Unix only).
 # No C code of ours, links against the system libc like any Rust binary.

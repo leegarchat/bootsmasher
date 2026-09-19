@@ -3,7 +3,8 @@
 //! Subprograms, each in its own directory: `vboot` (vendor_boot repair
 //! flow), `unpack` (extraction for boot + vendor_boot), `repack`
 //! (rebuild from an unpack dir), `cpio` (in-place newc surgery),
-//! `compress[=fmt]` + `decompress` (single-file codecs). Shared building
+//! `compress[=fmt]` + `decompress` (single-file codecs), `pick`
+//! (arrow-key menu for installer scripts). Shared building
 //! blocks live in `common`; the global help lives in `help`, per-subprogram
 //! texts in `<sub>/help.rs`. Every help prints the argv[0] basename, so a
 //! renamed binary documents itself correctly.
@@ -15,6 +16,7 @@ mod unpack;
 mod repack;
 mod cpio;
 mod compress;
+mod pick;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -77,6 +79,13 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 compress::help::short_decompress(prog)
             }
         }
+        "pick" => {
+            if expand {
+                pick::help::expand(prog)
+            } else {
+                pick::help::short(prog)
+            }
+        }
         _ => return None,
     };
     say(&text);
@@ -119,14 +128,14 @@ fn main() -> std::process::ExitCode {
                 ["expand", sub] => match sub_help(sub, &prog, true) {
                     Some(code) => std::process::ExitCode::from(code as u8),
                     None => {
-                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress)");
+                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress|pick)");
                         std::process::ExitCode::from(1)
                     }
                 },
                 [sub] => match sub_help(sub, &prog, false) {
                     Some(code) => std::process::ExitCode::from(code as u8),
                     None => {
-                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress)");
+                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress|pick)");
                         std::process::ExitCode::from(1)
                     }
                 },
@@ -152,8 +161,9 @@ fn main() -> std::process::ExitCode {
         "repack" => std::process::ExitCode::from(repack::run(&args[1..], &prog) as u8),
         "cpio" => std::process::ExitCode::from(cpio::run(&args[1..], &prog) as u8),
         "decompress" => std::process::ExitCode::from(compress::run_decompress(&args[1..], &prog) as u8),
+        "pick" => std::process::ExitCode::from(pick::run(&args[1..], &prog) as u8),
         other => {
-            eprintln!("unknown subprogram '{other}' (want vboot|unpack|repack|cpio|compress|decompress|compress=fmt)");
+            eprintln!("unknown subprogram '{other}' (want vboot|unpack|repack|cpio|compress|decompress|pick|compress=fmt)");
             std::process::ExitCode::from(1)
         }
     }

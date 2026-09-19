@@ -11,6 +11,8 @@ Subprograms:
   cpio          in-place newc archive surgery (magiskboot port)
   compress[=fmt]  squeeze one file with a codec (default gzip)
   decompress    expand one archive by magic
+  pick          arrow-key menu for installer scripts (device/slot pick,
+                Continue/Exit pacing, flash confirmation)
 
 Usage:
   {prog} <subprogram> [args...]
@@ -48,6 +50,8 @@ pub fn expand(prog: &str) -> String {
   compress[=gzip|xz|lzma|lz4|lz4_legacy]: one file, '-' is stdio;
     bzip2 refused (no backend built in).
   decompress: magic sniff + decode, extension stripped by default.
+  pick: Up/Down + Enter menu, prints the choice (exit 0), Esc aborts
+    (exit 1, empty stdout); --default answers without a terminal.
 
 Notes: pure Rust, no external commands; diagnostics go to stderr, so
 stdout stays a clean pipe (vboot/compress/decompress)."

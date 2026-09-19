@@ -1,5 +1,52 @@
 //! Global help texts. `{prog}` is the argv[0] basename at runtime.
+//! The `small` feature (recovery build) keeps vboot + install only,
+//! so the subprogram lists shrink with the build.
 
+#[cfg(feature = "small")]
+pub fn short(prog: &str) -> String {
+    format!(
+        "{prog} — standalone static Android boot-image surgery (small build: vboot + install only).
+
+Subprograms:
+  vboot         smart vendor_boot repair flow (Pixel 6 / gs101)
+  install       OrangeFox vendor_boot installer (export.txt paths,
+                bootloader-only fetch/flash, per-slot report) and
+                --file recovery install into a plain image
+
+Usage:
+  {prog} <subprogram> [args...]
+  {prog} <subprogram> --help      short manual for one subprogram
+  {prog} <subprogram> --expand    detailed manual for one subprogram
+  {prog} help [subprogram]        same as --help
+  {prog} help expand [subprogram] same as --expand
+  {prog} --version
+
+Exit codes everywhere: 0 ok, 1 usage error,
+2 broken input / failed verification."
+    )
+}
+
+#[cfg(feature = "small")]
+pub fn expand(prog: &str) -> String {
+    format!(
+        "{prog} — subprograms in detail, small build (short form: `{prog} --help`).
+
+  vboot: checks every vendor_boot fragment, repairs stale tables,
+    replaces the platform, splits/merges by subtree, verifies before
+    emitting (file or stdout pipe).
+  install: in-binary port of recovery_install_components/install.sh
+    (install.sh/install.bat only forward args); paths from export.txt,
+    rebuild/verify in-process, device traffic via fastboot/adb;
+    --file does the recovery install into a plain image file
+    (verify input, rebuild, verify output, write).
+
+Notes: pure Rust, no external commands; diagnostics go to stderr, so
+stdout stays a clean pipe (vboot). unpack/repack/cpio/compress/
+decompress/pick are compiled out of this build."
+    )
+}
+
+#[cfg(not(feature = "small"))]
 pub fn short(prog: &str) -> String {
     format!(
         "{prog} — standalone static Android boot-image surgery.
@@ -34,6 +81,7 @@ Exit codes everywhere: 0 ok, 1 usage error,
     )
 }
 
+#[cfg(not(feature = "small"))]
 pub fn expand(prog: &str) -> String {
     format!(
         "{prog} — subprograms in detail (short form: `{prog} --help`).
@@ -56,7 +104,9 @@ pub fn expand(prog: &str) -> String {
     (exit 1, empty stdout); --default answers without a terminal.
   install: in-binary port of recovery_install_components/install.sh
     (install.sh/install.bat only forward args); paths from export.txt,
-    rebuild/verify in-process, device traffic via fastboot/adb.
+    rebuild/verify in-process, device traffic via fastboot/adb;
+    --file does the recovery install into a plain image file
+    (verify input, rebuild, verify output, write).
 
 Notes: pure Rust, no external commands; diagnostics go to stderr, so
 stdout stays a clean pipe (vboot/compress/decompress)."

@@ -11,7 +11,7 @@ system/fastbootd during install.
 Flow:
   [1/5] device (auto, or arrow-key pick when several are attached)
   [2/5] install OrangeFox | restore a backup (+ slot/backup picks;
-        \"Назад\" steps one level up, \"Выход\"/Esc/q aborts cleanly)
+        \"Back\" steps one level up, \"Exit\"/Esc/q aborts cleanly)
   [3/5] fetch current stock -> backup/<datetime>/ (always, safety first)
   [4/5] rebuild with fox (install) or stage+verify backup (restore);
         short per-slot report; flash confirmation
@@ -29,6 +29,10 @@ export.txt next to the binary, then ./export.txt.
 Usage:
   {prog} install [--force] [--slot a|b|both] [--mode install|restore]
                  [--backup latest|STAMP] [--export FILE]
+  {prog} install --file -i INPUT -c CPIOPAYLOAD -o OUTPUT
+                 (recovery install into a plain image file: verify input,
+                 rebuild with the payload, verify output, write; no
+                 device, no backup, no menus; built for recovery use)
   install.sh / install.bat are thin launchers forwarding to this.
 
 Exit codes: 0 ok (or clean user abort, nothing flashed),
@@ -55,19 +59,26 @@ asked to send install.log to @OFRPforTensorDiscussion
 command that waives the policy (--force never waives the hard fit
 check, and restore still needs --backup in --force mode).
 
-Selection stages (\"Назад\" steps one level up; flag-fixed stages are
+Selection stages (\"Back\" steps one level up; flag-fixed stages are
 skipped AND skipped over when stepping back; the flash prompt's
-\"Назад\" returns to the last selection and re-runs fetch/prepare,
+\"Back\" returns to the last selection and re-runs fetch/prepare,
 which are idempotent):
-  mode    Установить OrangeFox | Восстановить бэкап (asked only when
+  mode    Install OrangeFox | Restore a backup (asked only when
           backups already exist)
-  slot    только a | только b | оба (a+b)
-  backup  newest first, labelled \"последний: <stamp> (<slots>)\"
-  pacing  Продолжить? (gate before the fetch)
+  slot    only a | only b | both (a+b)
+  backup  newest first, labelled \"latest: <stamp> (<slots>)\"
+  pacing  Continue? (gate before the fetch)
 
 Non-interactive: --force assumes install + both slots (mode/slot
 flags still narrow it); without a terminal on stdin --force is
 required.
+
+File mode (--file) needs no export.txt, no device and no terminal:
+the input image is verified, rebuilt with the cpio payload (vbmeta
+footer dropped, same recovery-install layout as the device flow),
+the result is verified again and only then written. Input and output
+must not be the same file. Verdict details go to stderr, short
+status lines to stdout.
 
 Exit codes: 0 ok (or clean user abort, nothing flashed),
 1 usage / no device, 2 build/verify/flash failure."

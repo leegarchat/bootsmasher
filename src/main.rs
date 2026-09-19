@@ -13,12 +13,24 @@
 mod common;
 mod help;
 mod vboot;
+// The `small` feature (recovery build) keeps vboot + install only.
+#[cfg(all(not(feature = "small"), feature = "spec"))]
 mod unpack;
+#[cfg(all(not(feature = "small"), feature = "spec"))]
 mod repack;
+#[cfg(not(feature = "small"))]
 mod cpio;
+#[cfg(not(feature = "small"))]
 mod compress;
+#[cfg(not(feature = "small"))]
 mod pick;
 mod install;
+
+/// Subprogram list for usage errors (shrinks with the build).
+#[cfg(feature = "small")]
+const SUBS: &str = "vboot|install";
+#[cfg(not(feature = "small"))]
+const SUBS: &str = "vboot|unpack|repack|cpio|compress|decompress|pick|install";
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,7 +48,7 @@ fn prog_name(argv0: &str) -> &str {
 }
 
 /// Print the manual for one subprogram (short or expand flavor).
-/// Returns None for an unknown name.
+/// Returns None for an unknown name (or a name compiled out by `small`).
 fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
     let text = match name {
         "vboot" => {
@@ -46,6 +58,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 vboot::help::short(prog)
             }
         }
+        #[cfg(all(not(feature = "small"), feature = "spec"))]
         "unpack" => {
             if expand {
                 unpack::help::expand(prog)
@@ -53,6 +66,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 unpack::help::short(prog)
             }
         }
+        #[cfg(all(not(feature = "small"), feature = "spec"))]
         "repack" => {
             if expand {
                 repack::help::expand(prog)
@@ -60,6 +74,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 repack::help::short(prog)
             }
         }
+        #[cfg(not(feature = "small"))]
         "cpio" => {
             if expand {
                 cpio::help::expand(prog)
@@ -67,6 +82,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 cpio::help::short(prog)
             }
         }
+        #[cfg(not(feature = "small"))]
         "compress" => {
             if expand {
                 compress::help::expand_compress(prog)
@@ -74,6 +90,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 compress::help::short_compress(prog)
             }
         }
+        #[cfg(not(feature = "small"))]
         "decompress" => {
             if expand {
                 compress::help::expand_decompress(prog)
@@ -81,6 +98,7 @@ fn sub_help(name: &str, prog: &str, expand: bool) -> Option<i32> {
                 compress::help::short_decompress(prog)
             }
         }
+        #[cfg(not(feature = "small"))]
         "pick" => {
             if expand {
                 pick::help::expand(prog)
@@ -137,14 +155,14 @@ fn main() -> std::process::ExitCode {
                 ["expand", sub] => match sub_help(sub, &prog, true) {
                     Some(code) => std::process::ExitCode::from(code as u8),
                     None => {
-                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress|pick|install)");
+                        eprintln!("unknown subprogram '{sub}' (want {SUBS})");
                         std::process::ExitCode::from(1)
                     }
                 },
                 [sub] => match sub_help(sub, &prog, false) {
                     Some(code) => std::process::ExitCode::from(code as u8),
                     None => {
-                        eprintln!("unknown subprogram '{sub}' (want vboot|unpack|repack|cpio|compress|decompress|pick|install)");
+                        eprintln!("unknown subprogram '{sub}' (want {SUBS})");
                         std::process::ExitCode::from(1)
                     }
                 },
@@ -154,6 +172,7 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        #[cfg(not(feature = "small"))]
         other if other == "compress" || other.starts_with("compress=") => {
             // The format is embedded in the command name itself.
             let fmt_str = other.strip_prefix("compress=").unwrap_or("gzip");
@@ -166,14 +185,19 @@ fn main() -> std::process::ExitCode {
             }
         }
         "vboot" => std::process::ExitCode::from(vboot::run(&args[1..], &prog) as u8),
+        #[cfg(all(not(feature = "small"), feature = "spec"))]
         "unpack" => std::process::ExitCode::from(unpack::run(&args[1..], &prog) as u8),
+        #[cfg(all(not(feature = "small"), feature = "spec"))]
         "repack" => std::process::ExitCode::from(repack::run(&args[1..], &prog) as u8),
+        #[cfg(not(feature = "small"))]
         "cpio" => std::process::ExitCode::from(cpio::run(&args[1..], &prog) as u8),
+        #[cfg(not(feature = "small"))]
         "decompress" => std::process::ExitCode::from(compress::run_decompress(&args[1..], &prog) as u8),
+        #[cfg(not(feature = "small"))]
         "pick" => std::process::ExitCode::from(pick::run(&args[1..], &prog) as u8),
         "install" => std::process::ExitCode::from(install::run(&args[1..], &prog) as u8),
         other => {
-            eprintln!("unknown subprogram '{other}' (want vboot|unpack|repack|cpio|compress|decompress|pick|install|compress=fmt)");
+            eprintln!("unknown subprogram '{other}' (want {SUBS})");
             std::process::ExitCode::from(1)
         }
     }

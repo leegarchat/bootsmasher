@@ -7,13 +7,18 @@
 //! `compress`) only depend on `common` (plus `vboot::ops`, the
 //! vendor_boot analyzer shared by `vboot`/`unpack`/`repack`).
 
+// bootimg/extract/spec serve unpack/repack only: compiled out of the
+// `small` build (vboot+install, for recovery ramdisks).
+#[cfg(not(feature = "small"))]
 pub(crate) mod bootimg;
 pub(crate) mod codec;
 pub(crate) mod cpio;
 pub(crate) mod dtb;
 pub(crate) mod error;
+#[cfg(not(feature = "small"))]
 pub(crate) mod extract;
 pub(crate) mod lz4legacy;
 pub(crate) mod space;
+#[cfg(all(not(feature = "small"), feature = "spec"))]
 pub(crate) mod spec;
 pub(crate) mod vendor;

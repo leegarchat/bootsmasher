@@ -239,6 +239,8 @@ impl Image {
 
 /// Tolerant vendor_boot diagnosis for `unpack`: never fails outright,
 /// explains every section (what is fine, what is broken and WHY).
+// Unused in the `small` build (no unpack subprogram there).
+#[cfg_attr(feature = "small", allow(dead_code))]
 #[derive(Debug)]
 pub struct FragDiag {
     pub index: usize,
@@ -253,6 +255,7 @@ pub struct FragDiag {
     pub why: String,
 }
 
+#[cfg_attr(feature = "small", allow(dead_code))]
 #[derive(Debug)]
 pub struct Diagnosis {
     pub header: Option<Header>,
@@ -272,6 +275,7 @@ pub struct Diagnosis {
     pub overall_ok: bool,
 }
 
+#[cfg_attr(feature = "small", allow(dead_code))]
 pub fn diagnose(bytes: &[u8]) -> Diagnosis {
     // Fast path: a fully consistent image maps 1:1 from analyze().
     if let Ok(a) = analyze(bytes) {

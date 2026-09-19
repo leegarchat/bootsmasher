@@ -30,6 +30,8 @@ impl Format {
         }
     }
 
+    // Used by compress/repack only: silent in the `small` build.
+    #[cfg_attr(feature = "small", allow(dead_code))]
     pub fn parse(s: &str) -> Result<Format> {
         match s.trim().to_ascii_lowercase().as_str() {
             "raw" | "none" | "cpio" => Ok(Format::Raw),
@@ -44,6 +46,8 @@ impl Format {
         }
     }
 
+    // Used by compress/repack only: silent in the `small` build.
+    #[cfg_attr(feature = "small", allow(dead_code))]
     pub fn is_compressed(self) -> bool {
         !matches!(self, Format::Raw)
     }
@@ -120,6 +124,8 @@ pub fn decompress(fmt: Format, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Compress raw bytes into `fmt` (Raw = verbatim).
+// Used by the compress subprogram only: silent in the `small` build.
+#[cfg_attr(feature = "small", allow(dead_code))]
 pub fn compress(fmt: Format, data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write as _;
     match fmt {

@@ -94,11 +94,14 @@ impl Header {
     }
 
 
+    // Header text helpers used by unpack/repack only: silent in `small`.
+    #[cfg_attr(feature = "small", allow(dead_code))]
     pub fn cmdline_str(&self) -> String {
         let end = self.cmdline.iter().position(|&b| b == 0).unwrap_or(self.cmdline.len());
         String::from_utf8_lossy(&self.cmdline[..end]).into_owned()
     }
 
+    #[cfg_attr(feature = "small", allow(dead_code))]
     pub fn name_str(&self) -> String {
         let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
         String::from_utf8_lossy(&self.name[..end]).into_owned()

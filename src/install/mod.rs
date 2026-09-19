@@ -35,14 +35,19 @@ struct Cli {
     mode: String,
     backup: String,
     export: String,
+    file: bool,
+    input: String,
+    cpio: String,
+    output: String,
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new() };
+    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--force" => c.force = true,
+            "--file" => c.file = true,
             "--slot" => {
                 i += 1;
                 c.slot = args.get(i).ok_or("--slot needs a|b|both".to_string())?.clone();
@@ -63,9 +68,36 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 c.export = args.get(i).ok_or("--export needs a file".to_string())?.clone();
             }
             s if s.starts_with("--export=") => c.export = s["--export=".len()..].to_string(),
+            "-i" | "--input" => {
+                i += 1;
+                c.input = args.get(i).ok_or("-i needs a vendor_boot image".to_string())?.clone();
+            }
+            s if s.starts_with("--input=") => c.input = s["--input=".len()..].to_string(),
+            "-c" | "--cpio" => {
+                i += 1;
+                c.cpio = args.get(i).ok_or("-c needs a recovery cpio payload".to_string())?.clone();
+            }
+            s if s.starts_with("--cpio=") => c.cpio = s["--cpio=".len()..].to_string(),
+            "-o" | "--output" => {
+                i += 1;
+                c.output = args.get(i).ok_or("-o needs an output path".to_string())?.clone();
+            }
+            s if s.starts_with("--output=") => c.output = s["--output=".len()..].to_string(),
             other => return Err(format!("unknown arg: {other}")),
         }
         i += 1;
+    }
+    if c.file {
+        if c.force || !c.slot.is_empty() || !c.mode.is_empty() || !c.backup.is_empty() || !c.export.is_empty() {
+            return Err("--file takes no --force/--slot/--mode/--backup/--export".to_string());
+        }
+        if c.input.is_empty() || c.cpio.is_empty() || c.output.is_empty() {
+            return Err("--file needs -i INPUT -c CPIOPAYLOAD -o OUTPUT".to_string());
+        }
+        return Ok(c);
+    }
+    if !c.input.is_empty() || !c.cpio.is_empty() || !c.output.is_empty() {
+        return Err("-i/-c/-o need --file".to_string());
     }
     match c.slot.as_str() {
         "" | "a" | "b" | "both" => {}
@@ -188,8 +220,8 @@ const LAUNCHER: &str = "install.bat";
 #[cfg(not(windows))]
 const LAUNCHER: &str = "./install.sh";
 
-const EXIT_ITEM: &str = "Выход";
-const BACK_ITEM: &str = "Назад";
+const EXIT_ITEM: &str = "Exit";
+const BACK_ITEM: &str = "Back";
 const MIN_PART_FREE: u64 = 7 * 1024 * 1024;
 
 struct Ctx {
@@ -430,18 +462,18 @@ fn build_stages(plan: &StagePlan, force: bool, mode: &str) -> Vec<Stage> {
 fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)], mut idx: usize) -> bool {
     let mut stages = build_stages(plan, ctx.force, &ctx.mode);
     if !stages.is_empty() {
-        ctx.step("[2/5] выбор");
+        ctx.step("[2/5] selection");
     }
     while idx < stages.len() {
         match stages[idx] {
             Stage::Mode => {
-                let opts = vec!["Установить OrangeFox".to_string(), "Восстановить бэкап".to_string(), EXIT_ITEM.to_string()];
-                match menu("Что делаем?", 1, &opts) {
-                    Ok(c) if c == "Установить OrangeFox" => {
+                let opts = vec!["Install OrangeFox".to_string(), "Restore a backup".to_string(), EXIT_ITEM.to_string()];
+                match menu("What to do?", 1, &opts) {
+                    Ok(c) if c == "Install OrangeFox" => {
                         ctx.mode = "install".to_string();
                         ctx.restore_src = None;
                     }
-                    Ok(c) if c == "Восстановить бэкап" => ctx.mode = "restore".to_string(),
+                    Ok(c) if c == "Restore a backup" => ctx.mode = "restore".to_string(),
                     _ => {
                         ctx.say("  aborted by user, nothing flashed");
                         return false;
@@ -457,15 +489,15 @@ fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)],
                     ["b"] => 2,
                     _ => 3,
                 };
-                let mut opts = vec!["только a".to_string(), "только b".to_string(), "оба (a+b)".to_string()];
+                let mut opts = vec!["only a".to_string(), "only b".to_string(), "both (a+b)".to_string()];
                 if idx > 0 {
                     opts.push(BACK_ITEM.to_string());
                 }
                 opts.push(EXIT_ITEM.to_string());
-                match menu("Слоты для прошивки:", def, &opts).as_deref() {
-                    Ok("только a") => ctx.slots = vec!["a".to_string()],
-                    Ok("только b") => ctx.slots = vec!["b".to_string()],
-                    Ok("оба (a+b)") => ctx.slots = vec!["a".to_string(), "b".to_string()],
+                match menu("Slots to flash:", def, &opts).as_deref() {
+                    Ok("only a") => ctx.slots = vec!["a".to_string()],
+                    Ok("only b") => ctx.slots = vec!["b".to_string()],
+                    Ok("both (a+b)") => ctx.slots = vec!["a".to_string(), "b".to_string()],
                     Ok(c) if c == BACK_ITEM => {
                         idx -= 1;
                         continue;
@@ -492,13 +524,13 @@ fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)],
                 let mut opts: Vec<String> = labels
                     .iter()
                     .enumerate()
-                    .map(|(i, l)| if i == 0 { format!("последний: {l}") } else { l.clone() })
+                    .map(|(i, l)| if i == 0 { format!("latest: {l}") } else { l.clone() })
                     .collect();
                 if idx > 0 {
                     opts.push(BACK_ITEM.to_string());
                 }
                 opts.push(EXIT_ITEM.to_string());
-                match menu("Бэкап для восстановления:", def, &opts) {
+                match menu("Backup to restore:", def, &opts) {
                     Ok(c) if c == BACK_ITEM => {
                         idx -= 1;
                         continue;
@@ -508,7 +540,7 @@ fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)],
                         return false;
                     }
                     Ok(c) => {
-                        let stamp = c.trim_start_matches("последний: ").split(" (").next().unwrap_or("");
+                        let stamp = c.trim_start_matches("latest: ").split(" (").next().unwrap_or("");
                         ctx.restore_src = Some(ctx.cfg.backup_dir.join(stamp));
                     }
                     Err(_) => {
@@ -521,13 +553,13 @@ fn run_selections(ctx: &mut Ctx, plan: &StagePlan, backups: &[(String, String)],
                 idx += 1;
             }
             Stage::Pacing => {
-                let mut opts = vec!["Продолжить".to_string()];
+                let mut opts = vec!["Continue".to_string()];
                 if idx > 0 {
                     opts.push(BACK_ITEM.to_string());
                 }
                 opts.push(EXIT_ITEM.to_string());
-                match menu("Продолжить?", 1, &opts).as_deref() {
-                    Ok("Продолжить") => idx += 1,
+                match menu("Continue?", 1, &opts).as_deref() {
+                    Ok("Continue") => idx += 1,
                     Ok(c) if c == BACK_ITEM => idx -= 1,
                     _ => {
                         ctx.say("  aborted by user, nothing flashed");
@@ -600,7 +632,7 @@ fn stage_device(ctx: &mut Ctx) -> bool {
     } else {
         ctx.say("  no device detected.");
         ctx.say("  Reboot it to the bootloader manually (VolDown+Power, or: adb reboot bootloader),");
-        let opts = vec!["Готово, проверять снова".to_string(), EXIT_ITEM.to_string()];
+        let opts = vec!["Ready, check again".to_string(), EXIT_ITEM.to_string()];
         match menu("Device ready?", 1, &opts).as_deref() {
             Ok(EXIT_ITEM) | Err(_) => {
                 ctx.say("  aborted by user, nothing flashed");
@@ -859,13 +891,13 @@ fn flash_menu(ctx: &mut Ctx, plan: &StagePlan) -> Result<bool, usize> {
             last = Some(i);
         }
     }
-    let mut opts = vec!["Да, прошить".to_string()];
+    let mut opts = vec!["Yes, flash".to_string()];
     if last.is_some() {
         opts.push(BACK_ITEM.to_string());
     }
     opts.push(EXIT_ITEM.to_string());
-    match menu("Прошить эти образы?", 1, &opts).as_deref() {
-        Ok("Да, прошить") => Ok(true),
+    match menu("Flash these images?", 1, &opts).as_deref() {
+        Ok("Yes, flash") => Ok(true),
         Ok(c) if c == BACK_ITEM => Err(last.unwrap_or(0)),
         _ => Ok(false),
     }
@@ -908,6 +940,79 @@ fn stage_flash(ctx: &mut Ctx) -> bool {
     true
 }
 
+/// `install --file`: recovery install into a plain image file, no
+/// device, no backup, no menus (built for recovery use).
+/// Verify input -> rebuild with the cpio payload (footer dropped,
+/// same layout as the device flow) -> verify output -> write.
+/// Exit codes: 0 ok, 1 usage, 2 verify/build failure.
+fn run_file(cli: &Cli) -> i32 {
+    println!("OrangeFox file install");
+    let same = std::path::absolute(&cli.input).ok() == std::path::absolute(&cli.output).ok();
+    if same {
+        eprintln!("usage error: input and output are the same file");
+        return 1;
+    }
+    let img = match std::fs::read(&cli.input) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  FAIL: cannot read input: {e}");
+            return 2;
+        }
+    };
+    let payload = match std::fs::read(&cli.cpio) {
+        Ok(b) => b,
+        Err(e) => {
+            println!("  FAIL: cannot read cpio payload: {e}");
+            return 2;
+        }
+    };
+    match verdict_text(&img, "input") {
+        Ok(t) => {
+            eprintln!("{t}");
+            match ops::analyze(&img) {
+                Ok(a) => println!("  ok: input valid ({} fragments, ramdisk {})", a.frags.len(), mb(a.header_ramdisk_size as u64)),
+                Err(e) => {
+                    println!("  FAIL: input unreadable: {e}");
+                    return 2;
+                }
+            }
+        }
+        Err(t) => {
+            eprintln!("{t}");
+            println!("  FAIL: input image INVALID, nothing written");
+            return 2;
+        }
+    }
+    let label = Path::new(&cli.cpio).file_name().and_then(|n| n.to_str()).unwrap_or("payload").to_string();
+    println!("  rebuild ({label}, footer dropped)");
+    let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((label, payload)), drop_footer: true };
+    let _quiet = QuietGuard::on();
+    let out = match ops::repack_with_opts(&img, None, opts) {
+        Ok(o) => o,
+        Err(e) => {
+            println!("  FAIL: rebuild failed, nothing written: {e}");
+            return 2;
+        }
+    };
+    match verdict_text(&out, "output") {
+        Ok(t) => eprintln!("{t}"),
+        Err(t) => {
+            eprintln!("{t}");
+            println!("  FAIL: rebuilt image INVALID, nothing written");
+            return 2;
+        }
+    }
+    match std::fs::write(&cli.output, &out) {
+        Ok(()) => println!("  ok: wrote {} ({})", cli.output, mb(out.len() as u64)),
+        Err(e) => {
+            println!("  FAIL: cannot write output: {e}");
+            return 2;
+        }
+    }
+    println!("RESULT: OK");
+    0
+}
+
 // ----------------------------------------------------------------- run ---
 
 /// Run `install`. Exit code (0 ok / clean abort, 1 usage / no device,
@@ -928,6 +1033,9 @@ pub fn run(args: &[String], prog: &str) -> i32 {
             return 1;
         }
     };
+    if cli.file {
+        return run_file(&cli);
+    }
     if !cli.force && !std::io::stdin().is_terminal() {
         eprintln!("no terminal on stdin: rerun in a terminal or pass --force");
         return 1;

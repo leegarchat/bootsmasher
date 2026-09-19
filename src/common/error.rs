@@ -9,6 +9,8 @@ pub enum Error {
     Usage(String),
     /// Operational failure with exit code 1 but no help dump
     /// (cpio `exists` on a missing entry, like magiskboot).
+    /// Unused in the `small` build (no cpio subprogram there).
+    #[cfg_attr(feature = "small", allow(dead_code))]
     Fail(String),
     Io(String),
     Parse(String),

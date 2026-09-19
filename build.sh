@@ -24,7 +24,7 @@ WIN_X64="x86_64-pc-windows-gnu"
 WIN_ARM64="aarch64-pc-windows-gnullvm"
 
 METHOD="auto"      # auto | cargo | cross
-SELECTED_ARCH="all" # all | x64 | x86 | arm64 | arm32 | win64 | winarm64 | linux | windows
+SELECTED_ARCH="all" # all | x64 | x86 | arm64 | arm32 | win64 | winarm64 | linux | windows | small
 
 usage() {
     cat <<EOF
@@ -37,18 +37,25 @@ Build method options:
   --auto           Auto-select: cross if containers exist, else cargo (default)
 
 Architecture selection:
-  --arch <type>    all (default), linux (4 musl), windows (2 gnu),
+  --arch <type>    all (default: full set + small set), linux (4 musl),
+                   windows (2 gnu), small (6 size-first vboot+install),
+                   small-x64, small-x86, small-arm64, small-arm32,
+                   small-win64, small-winarm64 (one small binary each),
                    x64, x86, arm64, arm32, win64, winarm64
   -h, --help       Show this message
 
 Examples:
   $0 --cargo --arch x64
   $0 --arch windows
+  $0 --arch small
   $0 --arch all
 
 Outputs:
   dist/bootsmasher-linux-*    Static musl binaries
   dist/bootsmasher-windows-*.exe
+  dist/bootsmasher-small-*    Size-first builds (profile small,
+                              --no-default-features --features small:
+                              vboot + install only, for recovery)
 EOF
     exit 0
 }
@@ -142,10 +149,14 @@ setup_linkers() {
 }
 
 build_target() {
-    local target="$1" output_name="$2"
+    local target="$1" output_name="$2" small="${3:-0}"
     echo ""
     echo "------------------------------------------------------------"
-    echo "Building [$output_name] -> $target"
+    if [[ "$small" == 1 ]]; then
+        echo "Building [small $output_name] -> $target"
+    else
+        echo "Building [$output_name] -> $target"
+    fi
     echo "------------------------------------------------------------"
     if [[ "$BUILDER" == "cargo" ]] && ! check_linker "$target"; then
         suggest_install "$target"
@@ -153,18 +164,30 @@ build_target() {
         return 0
     fi
     setup_linkers "$target"
-    if [[ "$BUILDER" == "cross" ]]; then
-        cross build --release --target "$target"
-    else
-        cargo build --release --target "$target"
-    fi
     local ext=""; [[ "$target" == *windows* ]] && ext=".exe"
-    local src_bin="$SCRIPT_DIR/target/$target/release/${BIN_NAME}${ext}"
+    local src_bin out_name
+    if [[ "$small" == 1 ]]; then
+        if [[ "$BUILDER" == "cross" ]]; then
+            cross build --profile small --no-default-features --features small --target "$target"
+        else
+            cargo build --profile small --no-default-features --features small --target "$target"
+        fi
+        src_bin="$SCRIPT_DIR/target/$target/small/${BIN_NAME}${ext}"
+        out_name="${BIN_NAME}-small-${output_name}${ext}"
+    else
+        if [[ "$BUILDER" == "cross" ]]; then
+            cross build --release --target "$target"
+        else
+            cargo build --release --target "$target"
+        fi
+        src_bin="$SCRIPT_DIR/target/$target/release/${BIN_NAME}${ext}"
+        out_name="${BIN_NAME}-${output_name}${ext}"
+    fi
     if [[ -f "$src_bin" ]]; then
-        cp "$src_bin" "$DIST_DIR/${BIN_NAME}-${output_name}${ext}"
+        cp "$src_bin" "$DIST_DIR/${out_name}"
         local size
-        size=$(stat -c%s "$DIST_DIR/${BIN_NAME}-${output_name}${ext}" 2>/dev/null || stat -f%z "$DIST_DIR/${BIN_NAME}-${output_name}${ext}")
-        echo "Success: $DIST_DIR/${BIN_NAME}-${output_name}${ext} ($size bytes)"
+        size=$(stat -c%s "$DIST_DIR/${out_name}" 2>/dev/null || stat -f%z "$DIST_DIR/${out_name}")
+        echo "Success: $DIST_DIR/${out_name} ($size bytes)"
     else
         echo "Error: binary not found: $src_bin"
         exit 1
@@ -186,16 +209,33 @@ build_windows() {
     build_target "$WIN_ARM64" "windows-arm64"
 }
 
+# Size-first set (vboot+install only, for recovery ramdisks).
+build_small() {
+    build_target "$LINUX_X64" "linux-x86_64" 1
+    build_target "$LINUX_X86" "linux-x86" 1
+    build_target "$LINUX_ARM64" "linux-arm64" 1
+    build_target "$LINUX_ARM32" "linux-arm32" 1
+    build_target "$WIN_X64" "windows-x86_64" 1
+    build_target "$WIN_ARM64" "windows-arm64" 1
+}
+
 case "$SELECTED_ARCH" in
-    all) build_linux; build_windows ;;
+    all) build_linux; build_windows; build_small ;;
     linux) build_linux ;;
     windows) build_windows ;;
+    small) build_small ;;
     x64) build_target "$LINUX_X64" "linux-x86_64" ;;
     x86) build_target "$LINUX_X86" "linux-x86" ;;
     arm64) build_target "$LINUX_ARM64" "linux-arm64" ;;
     arm32) build_target "$LINUX_ARM32" "linux-arm32" ;;
     win64) build_target "$WIN_X64" "windows-x86_64" ;;
     winarm64) build_target "$WIN_ARM64" "windows-arm64" ;;
+    small-x64) build_target "$LINUX_X64" "linux-x86_64" 1 ;;
+    small-x86) build_target "$LINUX_X86" "linux-x86" 1 ;;
+    small-arm64) build_target "$LINUX_ARM64" "linux-arm64" 1 ;;
+    small-arm32) build_target "$LINUX_ARM32" "linux-arm32" 1 ;;
+    small-win64) build_target "$WIN_X64" "windows-x86_64" 1 ;;
+    small-winarm64) build_target "$WIN_ARM64" "windows-arm64" 1 ;;
     *) echo "Error: unknown arch '$SELECTED_ARCH'"; usage ;;
 esac
 

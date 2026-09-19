@@ -15,11 +15,22 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std", "fra
 # Pure-Rust codecs for the unpack/repack subprograms (no C code anywhere).
 flate2 = "1"
 lzma-rust2 = { version = "0.20", default-features = false, features = ["std", "encoder", "xz"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.9"
+# spec.toml support (unpack/repack only): optional so the `small`
+# feature (vboot+install, for recovery ramdisks) drops them.
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.9", optional = true }
 # Arrow-key menus for the `pick` subprogram (installer UX).
 # Core Select only: default-features off drops editor/password/fuzzy.
 dialoguer = { version = "0.12", default-features = false }
+
+[features]
+default = ["spec"]
+# spec.toml read/write (needs serde+toml).
+spec = ["dep:serde", "dep:toml"]
+# Recovery build: only the vboot + install subprograms stay in the
+# binary (unpack/repack/cpio/compress/decompress/pick compiled out).
+# Build with: cargo build --profile small --no-default-features --features small
+small = []
 
 # statvfs binding for the pre-write free-space check (Unix only).
 # No C code of ours, links against the system libc like any Rust binary.
@@ -32,3 +43,8 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Size-first profile for the `small` feature (recovery ramdisks).
+[profile.small]
+inherits = "release"
+opt-level = "z"

@@ -76,6 +76,10 @@ fn s(bin: &Path, args: &[&str], log: &mut File) -> Result<Output> {
     cmd(bin, &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(), log)
 }
 
+fn cmd_with(bin: &Path, args: &[String], log: &mut File) -> Result<Output> {
+    cmd(bin, args, log)
+}
+
 /// Serials from `<tool> devices`: lines whose second column is `want`.
 pub fn serials(bin: &Path, want: &str, log: &mut File) -> Vec<String> {
     let out = match s(bin, &["devices"], log) {
@@ -97,6 +101,120 @@ pub fn serials(bin: &Path, want: &str, log: &mut File) -> Vec<String> {
         }
     }
     v
+}
+
+/// (serial, state) rows from `adb devices`: state is `device`
+/// (system), `recovery`, `sideload`, `unauthorized`, ... Callers split
+/// system vs recovery; anything else is shown but never auto-picked.
+pub fn adb_states(bin: &Path, log: &mut File) -> Vec<(String, String)> {
+    let out = match s(bin, &["devices"], log) {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let blob = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut v = Vec::new();
+    for line in blob.lines() {
+        let mut cols = line.split_whitespace();
+        if let (Some(ser), Some(state)) = (cols.next(), cols.next()) {
+            if ser == "List" {
+                continue;
+            }
+            v.push((ser.to_string(), state.to_string()));
+        }
+    }
+    v
+}
+
+/// `adb -s SERIAL shell CMD`, or `adb -s SERIAL shell su -c CMD`
+/// when `su` is true. One remote command string (no local shell).
+pub fn adb_shell(adb: &Path, serial: &str, su: bool, cmd: &str, log: &mut File) -> Result<Output> {
+    if su {
+        cmd_with(
+            adb,
+            &[
+                "-s".to_string(),
+                serial.to_string(),
+                "shell".to_string(),
+                "su".to_string(),
+                "-c".to_string(),
+                cmd.to_string(),
+            ],
+            log,
+        )
+    } else {
+        s(adb, &["-s", serial, "shell", cmd], log)
+    }
+}
+
+/// `adb -s SERIAL push LOCAL REMOTE`.
+pub fn adb_push(adb: &Path, serial: &str, local: &Path, remote: &str, log: &mut File) -> Result<()> {
+    let o = cmd_with(
+        adb,
+        &[
+            "-s".to_string(),
+            serial.to_string(),
+            "push".to_string(),
+            format!("{}", local.display()),
+            remote.to_string(),
+        ],
+        log,
+    )?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Verify(format!("push {} failed", local.display())))
+    }
+}
+
+/// `adb -s SERIAL pull REMOTE LOCAL`.
+pub fn adb_pull(adb: &Path, serial: &str, remote: &str, local: &Path, log: &mut File) -> Result<()> {
+    let o = cmd_with(
+        adb,
+        &[
+            "-s".to_string(),
+            serial.to_string(),
+            "pull".to_string(),
+            remote.to_string(),
+            format!("{}", local.display()),
+        ],
+        log,
+    )?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Verify(format!("pull {remote} failed")))
+    }
+}
+
+/// Block size in bytes via `blockdev --getsize64` (None when the
+/// command is missing or the output does not parse).
+pub fn adb_block_size(adb: &Path, serial: &str, su: bool, part: &str, log: &mut File) -> Option<u64> {
+    let out = adb_shell(adb, serial, su, &format!("blockdev --getsize64 /dev/block/by-name/{part}"), log).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// Best-effort `blockdev --setrw` on a block device: result ignored,
+/// the `dd` write decides.
+pub fn adb_setrw(adb: &Path, serial: &str, su: bool, part: &str, log: &mut File) {
+    let _ = adb_shell(adb, serial, su, &format!("blockdev --setrw /dev/block/by-name/{part}"), log);
+}
+
+/// `adb -s SERIAL reboot recovery` (the post-install offer on the
+/// adb-root transport).
+pub fn adb_reboot_recovery(adb: &Path, serial: &str, log: &mut File) -> Result<()> {
+    let o = s(adb, &["-s", serial, "reboot", "recovery"], log)?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Verify("adb reboot recovery failed".to_string()))
+    }
 }
 
 /// `fastboot -s SERIAL getvar KEY` value (first token after `KEY:`),
@@ -179,9 +297,14 @@ pub fn reboot_bootloader(fb: &Path, serial: &str, log: &mut File) {
     let _ = s(fb, &["-s", serial, "reboot", "bootloader"], log);
 }
 
-/// True when `adb -s SERIAL get-state` exits 0 (device in system).
-pub fn adb_alive(adb: &Path, serial: &str, log: &mut File) -> bool {
-    s(adb, &["-s", serial, "get-state"], log).map(|o| o.status.success()).unwrap_or(false)
+/// `fastboot -s SERIAL reboot recovery` (the post-install offer).
+pub fn reboot_recovery(fb: &Path, serial: &str, log: &mut File) -> Result<()> {
+    let o = s(fb, &["-s", serial, "reboot", "recovery"], log)?;
+    if o.status.success() {
+        Ok(())
+    } else {
+        Err(Error::Verify("reboot recovery failed".to_string()))
+    }
 }
 
 /// `adb -s SERIAL shell getprop PROP`, trimmed. None when empty/unreachable.

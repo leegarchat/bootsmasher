@@ -22,6 +22,9 @@ toml = { version = "0.9", optional = true }
 # Arrow-key menus for the `pick` subprogram (installer UX).
 # Core Select only: default-features off drops editor/password/fuzzy.
 dialoguer = { version = "0.12", default-features = false }
+# Colors + ColorfulTheme for the install menus/screens (console also
+# drives dialoguer under the hood; NO_COLOR respected, non-tty plain).
+console = "0.16"
 
 [features]
 default = ["spec"]

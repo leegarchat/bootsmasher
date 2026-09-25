@@ -27,6 +27,15 @@ Layout modes (mutually exclusive):
                       recovery fragment, the vendor blobs detach from it
                       (see expand). Conflicts with a platform file and
                       with --split-first-stage/--merge.
+  --recovery-is-platform var1|var2
+                      recovery-in-platform test layouts (install Type B/C):
+                      the --recovery file rides the platform fragment, no
+                      recovery fragment is emitted. var1 (Type B):
+                      platform = native first_stage + file; var2 (Type C):
+                      platform = file alone (must carry first_stage
+                      itself). Needs --recovery; conflicts with a platform
+                      file, --split-first-stage/--merge, --drop
+                      first-stage.
   --drop-footer      omit the trailing vbmeta/AVB/padding tail (needed
                       when the new content outgrows the partition;
                       recovery install drops it, unlocked bootloader
@@ -102,6 +111,18 @@ Recovery-install (--recovery <file>):
   the vbmeta/AVB tail is preserved unless --drop-footer; a grown
   ramdisk plus the old footer may exceed the partition — then drop
   the footer (unlocked bootloader required).
+
+Recovery-in-platform (--recovery-is-platform var1|var2, install Type B/C):
+  Test layouts for merged-platform stocks (gs101: no boot.img ramdisk,
+  platform is the only ramdisk on normal boot). No recovery fragment.
+  var1 (Type B): platform = native first_stage_ramdisk/** (refused when
+  absent) + file (file first-stage duplicates dropped, inbuild wins);
+  dlkm = valid original verbatim, else lib/** from the base pool.
+  var2 (Type C): platform = file alone (refused when the file carries no
+  first_stage_ramdisk/** — build a var2-AIO payload first); dlkm =
+  valid original verbatim (matches the stock kernel), else lib/** from
+  the file, else none. Old recovery-type originals are dropped in both
+  (replaced by the file in platform); other fragments carry over.
 
 First-stage rule, full form:
   With a platform file the base's own first_stage_ramdisk/** entries go

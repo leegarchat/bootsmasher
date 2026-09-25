@@ -60,16 +60,37 @@ pub enum Mode {
 /// platform file and with Split/Merge (enforced by the CLI, double-checked
 /// in [`repack_with_opts`]).
 ///
+/// `recovery_is_platform` (`--recovery-is-platform var1|var2`, install
+/// Type B/C) reuses the `recovery` payload but installs it into the
+/// platform fragment instead of a recovery fragment (see
+/// [`build_platform_recovery`]). Requires the payload; conflicts with a
+/// platform file, Split/Merge and `--drop first-stage` (the modes define
+/// their own first-stage handling).
+///
 /// `drop_footer` (`--drop-footer`): omit the trailing vbmeta/AVB/padding
 /// tail instead of carrying it verbatim. Needed when the new content no
 /// longer fits the partition next to the old footer (recovery install
 /// grows the ramdisk); like `repack --drop-footer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryInPlatform {
+    /// Type B — all-in-platform: native `first_stage_ramdisk/**` + payload
+    /// merged into the platform fragment, native dlkm kept, no recovery
+    /// fragment. Same branches as classic, single fragment to flash.
+    Var1,
+    /// Type C — payload-only platform: the native platform is fully
+    /// replaced by the payload (which must carry first_stage itself —
+    /// var2-AIO build, `build.sh --platform-recovery`); only kernel
+    /// modules are split into a dlkm fragment when present.
+    Var2,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepackOpts {
     pub mode: Mode,
     pub drop: Vec<String>,
     pub sets: Vec<(String, String)>,
     pub recovery: Option<(String, Vec<u8>)>,
+    pub recovery_is_platform: Option<RecoveryInPlatform>,
     pub drop_footer: bool,
 }
 
@@ -1305,6 +1326,173 @@ fn build_recovery(
     Ok((frags, table))
 }
 
+/// Recovery-in-platform test layouts (`--recovery-is-platform var1|var2`,
+/// install Type B/C): the payload rides the platform fragment, no recovery
+/// fragment is emitted. Rationale: on merged-platform stocks (gs101) the
+/// platform fragment is the only ramdisk on normal boot (no boot.img
+/// ramdisk), so a tools-only platform leaves the device with no init.
+///
+/// Patching per variant:
+/// - var1 (Type B): platform = native `first_stage_ramdisk/**` (refused
+///   when absent) + payload (payload first-stage duplicates dropped,
+///   inbuild wins, like the classic layout). dlkm = valid original
+///   verbatim, else `lib/**` pulled out of the pool. Old recovery-type
+///   originals are dropped (replaced by the payload in platform).
+/// - var2 (Type C): platform = payload alone (refused when the payload
+///   carries no `first_stage_ramdisk/**` — flashing a classic payload as
+///   the whole platform would brick normal boot the same way). dlkm =
+///   valid original verbatim (matches the stock kernel), else `lib/**`
+///   pulled out of the payload, else none.
+///
+/// `kept` (fragment `--drop` selectors) applies to the pool, the verbatim
+/// dlkm fallback and the carryovers, exactly like [`build_recovery`].
+fn build_platform_recovery(
+    im: &Image,
+    kept: &[bool],
+    drops: &DropSet,
+    orig: &OrigContent,
+    orig_valid_dlkm: Option<(RamdiskEntry, Vec<u8>)>,
+    variant: RecoveryInPlatform,
+    label: &str,
+    data: &[u8],
+) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
+    // Entry pool: same sourcing as build_recovery (per-fragment when the
+    // kept set is usable, whole-blob rescue on a stale table).
+    let src: Vec<(u32, Vec<Entry>)> = if orig.table_ok {
+        orig.frags.iter().map(|(e, en)| (e.entry_type, en.clone())).collect()
+    } else {
+        vec![(TYPE_PLATFORM, whole_blob_entries(im)?)]
+    };
+    let mut pool: Vec<Entry> = Vec::new();
+    let mut fs_entries: Vec<Entry> = Vec::new();
+    for (_, en) in &src {
+        for e in en {
+            if cpio::name_str(e) == "TRAILER!!!" {
+                continue;
+            }
+            pool.push(e.clone());
+            if cpio::is_first_stage_path(&cpio::name_str(e)) {
+                fs_entries.push(e.clone());
+            }
+        }
+    }
+    // Payload: validated like a platform file (compressed stays verbatim,
+    // raw cpio gets compressed).
+    let fox_raw = normalize_input(label, data)?;
+    let fox_entries = blob_entries(&fox_raw)
+        .map_err(|e| Error::Parse(format!("internal error re-reading recovery file: {e}")))?;
+    let fox_fs = fox_entries
+        .iter()
+        .filter(|e| cpio::is_first_stage_path(&cpio::name_str(e)))
+        .count();
+    let (fox_plat, plat_src): (Vec<u8>, Vec<Entry>) = match variant {
+        RecoveryInPlatform::Var1 => {
+            if fs_entries.is_empty() {
+                return Err(Error::Parse(
+                    "refusing recovery-is-platform var1: no first_stage_ramdisk/** in the kept base content".to_string(),
+                ));
+            }
+            // Inbuild first-stage wins over payload duplicates.
+            let (stripped, n) = strip_first_stage(fox_entries);
+            if n > 0 {
+                note!("dropped {n} first-stage duplicates from {label} (inbuild first-stage wins)");
+            }
+            let mut plat = fs_entries.clone();
+            plat.extend(cpio::drop_trailers(&stripped));
+            let raw = lz4legacy::compress_legacy(&cpio::build(&cpio::drop_trailers(&plat)));
+            let entries = blob_entries(&raw)
+                .map_err(|e| Error::Parse(format!("internal error re-reading var1 platform: {e}")))?;
+            (raw, entries)
+        }
+        RecoveryInPlatform::Var2 => {
+            if fox_fs == 0 {
+                return Err(Error::Parse(
+                    "refusing recovery-is-platform var2: payload carries no first_stage_ramdisk/** (build a var2-AIO payload with build.sh --platform-recovery)".to_string(),
+                ));
+            }
+            // Payload as-is (verbatim bytes when already compressed).
+            let entries = blob_entries(&fox_raw)
+                .map_err(|e| Error::Parse(format!("internal error re-reading var2 platform: {e}")))?;
+            (fox_raw, entries)
+        }
+    };
+    let _ = drops;
+    let n_plat = plat_src.iter().filter(|e| cpio::name_str(e) != "TRAILER!!!").count();
+    if n_plat == 0 {
+        return Err(Error::Parse(format!(
+            "refusing recovery-is-platform {}: platform payload is empty",
+            match variant {
+                RecoveryInPlatform::Var1 => "var1",
+                RecoveryInPlatform::Var2 => "var2",
+            }
+        )));
+    }
+    let mut frags: Vec<Vec<u8>> = Vec::new();
+    let mut table: Vec<RamdiskEntry> = Vec::new();
+    let mut e0 = RamdiskEntry::platform(fox_plat.len() as u32);
+    e0.board_id = board_id_of(im, kept, TYPE_PLATFORM);
+    let off = fox_plat.len() as u32;
+    frags.push(fox_plat);
+    table.push(e0);
+    // produced[] tracks (type, name) for the carryover filter; every kept
+    // original recovery fragment is listed so none survives (replaced by
+    // the payload in platform), like build_recovery.
+    let mut produced: Vec<(u32, String)> = vec![(TYPE_PLATFORM, String::new())];
+    for (i, e) in im.table.iter().enumerate() {
+        if e.entry_type == TYPE_RECOVERY && kept.get(i).copied().unwrap_or(false) {
+            produced.push((TYPE_RECOVERY, e.name_str()));
+        }
+    }
+    let (_, _, pool_lib) = cpio::partition(&pool);
+    // Modules already stored outside platform? A kept non-platform,
+    // non-recovery fragment holding lib/** payload (16K, a dlkm under
+    // another name, ...) means pulling a second copy into a fresh dlkm
+    // is pure duplication. Recovery originals don't count: they are
+    // being replaced. Mirrors build_recovery.
+    let pool_lib_stored = orig.table_ok
+        && orig.frags.iter().any(|(e, en)| {
+            e.entry_type != TYPE_PLATFORM
+                && e.entry_type != TYPE_RECOVERY
+                && {
+                    let (_, _, lib) = cpio::partition(en);
+                    cpio::has_payload(&lib)
+                }
+        });
+    // dlkm: valid original verbatim first (matches the stock kernel), else
+    // lib/** pulled out of the pool (var1) or out of the payload (var2),
+    // else none.
+    let fresh_lib: Vec<Entry> = match variant {
+        RecoveryInPlatform::Var1 => pool_lib,
+        RecoveryInPlatform::Var2 => {
+            let (_, _, fox_lib) = cpio::partition(&plat_src);
+            fox_lib
+        }
+    };
+    if let Some((mut e, raw)) = orig_valid_dlkm {
+        e.offset = off;
+        e.size = raw.len() as u32;
+        note!("dlkm: kept original {:?} verbatim ({} bytes)", e.name_str(), raw.len());
+        frags.push(raw);
+        table.push(e.clone());
+        produced.push((TYPE_DLKM, e.name_str()));
+    } else if pool_lib_stored {
+        note!("note: kept fragment(s) already store lib/** modules, no fresh dlkm pulled");
+    } else if cpio::has_payload(&fresh_lib) {
+        let dlkm_raw = lz4legacy::compress_legacy(&cpio::build(&fresh_lib));
+        let mut e1 = RamdiskEntry::dlkm(dlkm_raw.len() as u32, off);
+        e1.board_id = board_id_of(im, kept, TYPE_DLKM);
+        let n_lib = fresh_lib.iter().filter(|e| cpio::name_str(e) != "TRAILER!!!").count();
+        note!("dlkm: pulled {n_lib} lib/** entries into a fresh dlkm ({} bytes)", dlkm_raw.len());
+        frags.push(dlkm_raw);
+        table.push(e1);
+        produced.push((TYPE_DLKM, "dlkm".to_string()));
+    } else {
+        note!("note: no dlkm content (no valid original, no lib/** payload), no dlkm emitted");
+    }
+    append_carryovers(&mut frags, &mut table, im, &produced, kept);
+    Ok((frags, table))
+}
+
 /// Main repack routine.
 ///
 /// - `platform`: optional (path label, bytes) replacement content.
@@ -1326,7 +1514,7 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
     repack_with_opts(
         orig_bytes,
         platform,
-        RepackOpts { mode, drop: Vec::new(), sets: Vec::new(), recovery: None, drop_footer: false },
+        RepackOpts { mode, drop: Vec::new(), sets: Vec::new(), recovery: None, recovery_is_platform: None, drop_footer: false },
     )
 }
 
@@ -1418,7 +1606,27 @@ pub fn repack_with_opts(
         out
     };
 
-    let (new_frags_raw, new_entries) = if let Some((label, data)) = &opts.recovery {
+    let (new_frags_raw, new_entries) = if let Some(variant) = opts.recovery_is_platform {
+        if platform.is_some() {
+            return Err(Error::Usage(
+                "--recovery-is-platform conflicts with a platform file (pick one replacement)".to_string(),
+            ));
+        }
+        if mode != Mode::Keep {
+            return Err(Error::Usage(
+                "--recovery-is-platform conflicts with --split-first-stage/--merge".to_string(),
+            ));
+        }
+        if drops.first_stage {
+            return Err(Error::Usage(
+                "--recovery-is-platform defines its own first-stage handling (no --drop first-stage)".to_string(),
+            ));
+        }
+        let (label, data) = opts.recovery.as_ref().ok_or_else(|| {
+            Error::Usage("--recovery-is-platform needs a payload (--recovery <file>)".to_string())
+        })?;
+        build_platform_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, variant, label, data)?
+    } else if let Some((label, data)) = &opts.recovery {
         if platform.is_some() {
             return Err(Error::Usage(
                 "--recovery conflicts with a platform file (pick one replacement)".to_string(),

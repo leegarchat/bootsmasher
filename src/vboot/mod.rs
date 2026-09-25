@@ -16,7 +16,7 @@ use crate::common::error::{Error, Result};
 use crate::common::space;
 use crate::common::vendor::type_name;
 use crate::common::lz4legacy::BlobKind;
-use ops::{Mode, RepackOpts};
+use ops::{Mode, RecoveryInPlatform, RepackOpts};
 
 
 pub fn run(args: &[String], prog: &str) -> i32 {
@@ -45,6 +45,7 @@ struct Cli {
     vboot: String,
     platform_path: Option<String>,
     recovery_path: Option<String>,
+    recovery_is_platform: Option<RecoveryInPlatform>,
     out_path: Option<String>,
     verify_only: bool,
     /// Verify mode with a platform/recovery file or --drop: dry-run the pipeline.
@@ -62,6 +63,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
     let mut vboot: Option<String> = None;
     let mut platform_path: Option<String> = None;
     let mut recovery_path: Option<String> = None;
+    let mut recovery_is_platform: Option<RecoveryInPlatform> = None;
     let mut out_positional: Option<String> = None;
     let mut out_flag: Option<String> = None;
     let mut verify_only = false;
@@ -120,6 +122,28 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
                     args.get(i).ok_or_else(|| Error::Usage("--recovery needs a file".to_string()))?.clone(),
                 );
             }
+            "--recovery-is-platform" => {
+                i += 1;
+                if recovery_is_platform.is_some() {
+                    return Err(Error::Usage("--recovery-is-platform given twice".to_string()));
+                }
+                let v = args.get(i).ok_or_else(|| Error::Usage("--recovery-is-platform needs var1|var2".to_string()))?;
+                recovery_is_platform = Some(match v.as_str() {
+                    "var1" => RecoveryInPlatform::Var1,
+                    "var2" => RecoveryInPlatform::Var2,
+                    _ => return Err(Error::Usage("--recovery-is-platform needs var1|var2".to_string())),
+                });
+            }
+            s if s.starts_with("--recovery-is-platform=") => {
+                if recovery_is_platform.is_some() {
+                    return Err(Error::Usage("--recovery-is-platform given twice".to_string()));
+                }
+                recovery_is_platform = Some(match &s["--recovery-is-platform=".len()..] {
+                    "var1" => RecoveryInPlatform::Var1,
+                    "var2" => RecoveryInPlatform::Var2,
+                    _ => return Err(Error::Usage("--recovery-is-platform needs var1|var2".to_string())),
+                });
+            }
             "--drop-footer" => drop_footer = true,
             "-s" | "--set" => {
                 i += 1;
@@ -157,6 +181,20 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
     if recovery_path.is_some() && mode != Mode::Keep {
         return Err(Error::Usage("--recovery conflicts with --split-first-stage/--merge".to_string()));
     }
+    if recovery_is_platform.is_some() {
+        if platform_path.is_some() {
+            return Err(Error::Usage("--recovery-is-platform conflicts with a platform file".to_string()));
+        }
+        if mode != Mode::Keep {
+            return Err(Error::Usage("--recovery-is-platform conflicts with --split-first-stage/--merge".to_string()));
+        }
+        if recovery_path.is_none() {
+            return Err(Error::Usage("--recovery-is-platform needs a payload (--recovery <file>)".to_string()));
+        }
+        if drop.iter().any(|s| s == "first-stage" || s == "first_stage") {
+            return Err(Error::Usage("--recovery-is-platform defines its own first-stage handling (no --drop first-stage)".to_string()));
+        }
+    }
     if verify_only {
         let v = vboot.ok_or_else(|| Error::Usage("--verify needs <vboot.img>".to_string()))?;
         if out_positional.is_some() || out_flag.is_some() {
@@ -177,6 +215,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
             vboot: v,
             platform_path,
             recovery_path,
+            recovery_is_platform,
             out_path: None,
             verify_only: true,
             dry_run,
@@ -197,6 +236,7 @@ fn parse_cli(args: &[String]) -> Result<Cli> {
         vboot: v,
         platform_path,
         recovery_path,
+        recovery_is_platform,
         out_path: out_flag.or(out_positional),
         verify_only: false,
         dry_run: false,
@@ -259,6 +299,7 @@ fn run_inner(args: &[String]) -> Result<()> {
                 drop: cli.drop.clone(),
                 sets: cli.sets.clone(),
                 recovery: rec_data,
+                recovery_is_platform: cli.recovery_is_platform,
                 drop_footer: cli.drop_footer,
             },
         )?;
@@ -303,6 +344,7 @@ fn run_inner(args: &[String]) -> Result<()> {
             drop: cli.drop.clone(),
             sets: cli.sets.clone(),
             recovery: rec_ref,
+            recovery_is_platform: cli.recovery_is_platform,
             drop_footer: cli.drop_footer,
         },
     )?;

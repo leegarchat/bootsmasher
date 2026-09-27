@@ -40,11 +40,15 @@ Paths (fastboot/adb, recovery payload, backup dir) come from export.txt:
 KEY=VALUE lines, # comments; relative paths resolve against the
 directory holding export.txt. Lookup: --export FILE, then
 export.txt next to the binary, then ./export.txt.
+--recovery-img PATH overrides export.txt RECOVERY_IMG for this run
+(drag-and-drop in the desktop launchers forwards the dropped cpio
+here, so export.txt never needs editing; a relative PATH resolves
+against the working directory).
 
 Usage:
   {prog} install [--force] [--slot a|b|both] [--mode install|restore]
                  [--backup latest|STAMP] [--transport fastboot|adb]
-                 [--export FILE]
+                 [--export FILE] [--recovery-img PATH]
   {prog} install --demo   (UI preview: canned device, same menus and
                  screens, no fastboot/adb, nothing read or flashed)
   {prog} install --file -i INPUT -c CPIOPAYLOAD -o OUTPUT [--log FILE]

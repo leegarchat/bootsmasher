@@ -35,7 +35,8 @@ pub fn expand(prog: &str) -> String {
     replaces the platform, splits/merges by subtree, verifies before
     emitting (file or stdout pipe).
   install: in-binary port of recovery_install_components/install.sh
-    (install.sh/install.bat only forward args); paths from export.txt,
+    (install.sh/install.bat only forward args); paths from export.txt
+    (--recovery-img PATH overrides RECOVERY_IMG for one run),
     rebuild/verify in-process, device traffic via fastboot/adb;
     --file does the recovery install into a plain image file
     (verify input, rebuild, verify output, write).
@@ -103,7 +104,8 @@ pub fn expand(prog: &str) -> String {
   pick: Up/Down + Enter menu, prints the choice (exit 0), Esc aborts
     (exit 1, empty stdout); --default answers without a terminal.
   install: in-binary port of recovery_install_components/install.sh
-    (install.sh/install.bat only forward args); paths from export.txt,
+    (install.sh/install.bat only forward args); paths from export.txt
+    (--recovery-img PATH overrides RECOVERY_IMG for one run),
     rebuild/verify in-process, device traffic via fastboot/adb;
     --file does the recovery install into a plain image file
     (verify input, rebuild, verify output, write).

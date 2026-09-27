@@ -37,6 +37,7 @@ struct Cli {
     mode: String,
     backup: String,
     export: String,
+    recovery_img: String,
     file: bool,
     input: String,
     cpio: String,
@@ -67,7 +68,7 @@ fn layout_name(v: &str) -> &'static str {
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new(), log: String::new(), recovery_is_platform: String::new(), transport: String::new(), demo: false };
+    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), recovery_img: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new(), log: String::new(), recovery_is_platform: String::new(), transport: String::new(), demo: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,6 +95,11 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 c.export = args.get(i).ok_or("--export needs a file".to_string())?.clone();
             }
             s if s.starts_with("--export=") => c.export = s["--export=".len()..].to_string(),
+            "--recovery-img" => {
+                i += 1;
+                c.recovery_img = args.get(i).ok_or("--recovery-img needs a recovery cpio payload".to_string())?.clone();
+            }
+            s if s.starts_with("--recovery-img=") => c.recovery_img = s["--recovery-img=".len()..].to_string(),
             "-i" | "--input" => {
                 i += 1;
                 c.input = args.get(i).ok_or("-i needs a vendor_boot image".to_string())?.clone();
@@ -138,7 +144,7 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
     }
     if c.demo {
         if c.force || c.file || !c.slot.is_empty() || !c.mode.is_empty() || !c.backup.is_empty()
-            || !c.export.is_empty() || !c.input.is_empty() || !c.cpio.is_empty()
+            || !c.export.is_empty() || !c.recovery_img.is_empty() || !c.input.is_empty() || !c.cpio.is_empty()
             || !c.output.is_empty() || !c.log.is_empty() || !c.recovery_is_platform.is_empty()
             || !c.transport.is_empty()
         {
@@ -147,8 +153,8 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         return Ok(c);
     }
     if c.file {
-        if c.force || !c.slot.is_empty() || !c.mode.is_empty() || !c.backup.is_empty() || !c.export.is_empty() || !c.transport.is_empty() {
-            return Err("--file takes no --force/--slot/--mode/--backup/--export/--transport".to_string());
+        if c.force || !c.slot.is_empty() || !c.mode.is_empty() || !c.backup.is_empty() || !c.export.is_empty() || !c.recovery_img.is_empty() || !c.transport.is_empty() {
+            return Err("--file takes no --force/--slot/--mode/--backup/--export/--recovery-img/--transport".to_string());
         }
         if c.input.is_empty() || c.cpio.is_empty() || c.output.is_empty() {
             return Err("--file needs -i INPUT -c CPIOPAYLOAD -o OUTPUT".to_string());
@@ -259,7 +265,7 @@ fn find_export(cli_export: &str) -> Result<PathBuf, String> {
     Err("no export.txt (put it next to the binary or run from its directory; --export FILE overrides)".to_string())
 }
 
-fn resolve_config(export_path: &Path) -> Result<Config, String> {
+fn resolve_config(export_path: &Path, recovery_override: &str) -> Result<Config, String> {
     let map = parse_export(export_path)?;
     let base = export_path.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
     let get = |k: &str, dflt: &str| map.get(k).cloned().unwrap_or_else(|| dflt.to_string());
@@ -267,7 +273,21 @@ fn resolve_config(export_path: &Path) -> Result<Config, String> {
         let p = PathBuf::from(v);
         if p.is_absolute() { p } else { base.join(p) }
     };
-    let recovery_img = rel(&get("RECOVERY_IMG", "OrangeFox-R12.0-test5-aio.ramdisk.lz4"));
+    // Drag-and-drop override (desktop launchers forward the dropped cpio
+    // as --recovery-img): wins over export.txt RECOVERY_IMG without
+    // editing the file, and applies BEFORE the stock path is probed, so
+    // a stale export.txt entry never blocks the run. A relative override
+    // resolves against the working directory (CLI semantics); export.txt
+    // relatives still resolve against the export file's own directory.
+    let recovery_img = if !recovery_override.is_empty() {
+        let p = PathBuf::from(recovery_override);
+        if !p.is_file() {
+            return Err(format!("--recovery-img not found: {}", p.display()));
+        }
+        p
+    } else {
+        rel(&get("RECOVERY_IMG", "OrangeFox-R12.0-test5-aio.ramdisk.lz4"))
+    };
     let backup_dir = rel(&get("BACKUP_DIR", "backup"));
     let log_dir = rel(&get("LOG_DIR", "logs"));
     let pt_key = if cfg!(windows) { "PLATFORM_TOOLS_WINDOWS" } else { "PLATFORM_TOOLS_LINUX" };
@@ -2170,7 +2190,7 @@ pub fn run(args: &[String], prog: &str) -> i32 {
             return 1;
         }
     };
-    let cfg = match resolve_config(&export_path) {
+    let cfg = match resolve_config(&export_path, &cli.recovery_img) {
         Ok(c) => c,
         Err(m) => {
             eprintln!("{m}");

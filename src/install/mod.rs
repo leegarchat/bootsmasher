@@ -19,7 +19,8 @@ use std::fmt;
 use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Stdio;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::codec;
 use crate::common::cpio;
@@ -197,6 +198,9 @@ struct Config {
     /// Per-run logs live apart from image backups: logs/<stamp>/.
     log_dir: PathBuf,
     tools: Tools,
+    /// Human-readable tool sources for the run log
+    /// ("<path> (bundled)" or "fastboot (PATH fallback)").
+    tools_line: String,
     /// Minimum free bytes a flashed image must leave in the partition
     /// (export.txt MIN_FREE_MB, default 7).
     min_free: u64,
@@ -298,17 +302,119 @@ fn resolve_config(export_path: &Path, recovery_override: &str) -> Result<Config,
     if !recovery_img.is_file() {
         return Err(format!("missing recovery payload: {}", recovery_img.display()));
     }
-    if !fastboot.is_file() {
-        return Err(format!("missing fastboot binary: {}", fastboot.display()));
-    }
-    if !adb.is_file() {
-        return Err(format!("missing adb binary: {}", adb.display()));
-    }
+    // Opt-in PATH fallback (export.txt FALLBACK_PATH=1/true/yes/on):
+    // when the bundled platform-tools binary is missing or will not
+    // even start on this CPU (wrong-arch Exec format error, missing
+    // loader), fall back to fastboot/adb from PATH. Off by default:
+    // without the explicit opt-in a missing binary stays a hard error.
+    let fallback = matches!(map.get("FALLBACK_PATH").map(|v| v.to_ascii_lowercase()).as_deref(), Some("1" | "true" | "yes" | "on"));
+    let (fastboot, fastboot_note) = resolve_tool(&fastboot, &get("FASTBOOT_BIN", "fastboot"), "fastboot", fallback)?;
+    let (adb, adb_note) = resolve_tool(&adb, &get("ADB_BIN", "adb"), "adb", fallback)?;
+    let tools_line = format!("fastboot: {fastboot_note}; adb: {adb_note}");
     let min_free_mb: u64 = match map.get("MIN_FREE_MB") {
         None => 7,
         Some(v) => v.parse().map_err(|_| format!("bad MIN_FREE_MB in export.txt: '{v}' (want MiB integer)"))?,
     };
-    Ok(Config { recovery_img, backup_dir, log_dir, tools: Tools { fastboot, adb }, min_free: min_free_mb * 1024 * 1024, min_free_mb })
+    Ok(Config { recovery_img, backup_dir, log_dir, tools: Tools { fastboot, adb }, tools_line, min_free: min_free_mb * 1024 * 1024, min_free_mb })
+}
+
+/// Can this tool binary actually run here? Spawns `<bin> --version`
+/// and waits up to 5 s: a missing file, a wrong-arch binary (Exec
+/// format error at spawn) or a missing loader all fail; any exit
+/// status counts as runnable (the version output itself is ignored).
+/// No logging — the run log does not exist yet at config time.
+fn probe_tool(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let mut child = match std::process::Command::new(path)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+/// `name` on PATH (bare binary name; `.exe` tried too on Windows).
+/// Skips non-files (and non-executable files on Unix).
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&paths) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let cand = dir.join(name);
+        if file_runnable(&cand) {
+            return Some(cand);
+        }
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn file_runnable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    p.is_file() && p.metadata().map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn file_runnable(p: &Path) -> bool {
+    p.is_file()
+}
+
+/// Pick the binary for one tool: the bundled export.txt path when it
+/// runs here, else (only with the FALLBACK_PATH opt-in) the same
+/// binary name from PATH. Returns the path to use plus a short
+/// source note for the run log. Each tool falls back independently.
+fn resolve_tool(primary: &Path, bin_name: &str, dflt: &str, fallback: bool) -> Result<(PathBuf, String), String> {
+    if probe_tool(primary) {
+        let note = format!("{} (bundled)", primary.display());
+        return Ok((primary.to_path_buf(), note));
+    }
+    // PATH lookup uses just the file name (a configured absolute path
+    // still falls back to its basename, e.g. /opt/x/fastboot -> fastboot).
+    let mut name = Path::new(bin_name).file_name().and_then(|n| n.to_str()).unwrap_or(dflt).to_string();
+    if name.is_empty() {
+        name = dflt.to_string();
+    }
+    #[cfg(windows)]
+    if Path::new(&name).extension().is_none() {
+        name.push_str(".exe");
+    }
+    if fallback {
+        if find_on_path(&name).is_some() {
+            // Bare name on purpose: resolved via PATH at spawn time,
+            // so a later-installed tool still works mid-session.
+            return Ok((PathBuf::from(name.clone()), format!("{name} (PATH fallback)")));
+        }
+        return Err(format!("no runnable {dflt}: {} is missing or not for this CPU, and nothing named '{name}' on PATH (FALLBACK_PATH=1 is set)", primary.display()));
+    }
+    Err(format!("no runnable {dflt}: {} (missing or not for this CPU; set FALLBACK_PATH=1 in export.txt to allow PATH fallback)", primary.display()))
 }
 
 // ------------------------------------------------------------ session ---
@@ -1908,6 +2014,7 @@ fn run_demo() -> i32 {
     }
     println!("OrangeFox vendor_boot installer");
     println!("{}", style("(demo — no device touched, nothing flashed)").dim());
+    println!("  {} fastboot: bin/linux/platform-tools/fastboot (bundled); adb: bin/linux/platform-tools/adb (bundled)", dot());
     macro_rules! dabort {
         () => {{
             println!("  aborted by user, nothing flashed");
@@ -2217,6 +2324,7 @@ pub fn run(args: &[String], prog: &str) -> i32 {
     let _ = writeln!(log, "install {stamp} force={} slot={} mode={} backup={}", cli.force as u8, cli.slot, cli.mode, cli.backup);
     let _ = writeln!(log, "export: {}", export_path.display());
     let _ = writeln!(log, "recovery: {}", cfg.recovery_img.display());
+    let _ = writeln!(log, "tools: {}", cfg.tools_line);
     let _ = writeln!(log, "{} {}", prog, env!("CARGO_PKG_VERSION"));
     fb::version(&cfg.tools.fastboot, &mut log);
 
@@ -2245,6 +2353,7 @@ pub fn run(args: &[String], prog: &str) -> i32 {
     };
 
     ctx.say("OrangeFox vendor_boot installer");
+    ctx.say(&format!("  • {}", ctx.cfg.tools_line));
     match stage_device(&mut ctx, &cli.transport) {
         DevStage::Abort => return 0,
         DevStage::Fail => return 1,

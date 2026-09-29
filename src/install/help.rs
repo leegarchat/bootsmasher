@@ -81,6 +81,10 @@ export.txt keys (all optional, built-ins shown):
   PLATFORM_TOOLS_WINDOWS=platform-tools-windows
   FASTBOOT_BIN=fastboot        (resolved inside the platform-tools dir;
   ADB_BIN=adb                   .exe is appended on Windows when missing)
+  FALLBACK_PATH=0              (opt-in PATH fallback: 1/true/yes/on lets
+                               a missing or wrong-CPU bundled binary fall
+                               back to fastboot/adb from PATH, each tool
+                               independently; off by default)
 
 Free-space policy: a flashed image must leave >= MIN_FREE_MB MiB
 free in the partition (export.txt, default 7). Below that (but still

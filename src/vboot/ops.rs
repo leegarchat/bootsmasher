@@ -92,6 +92,34 @@ pub struct RepackOpts {
     pub recovery: Option<(String, Vec<u8>)>,
     pub recovery_is_platform: Option<RecoveryInPlatform>,
     pub drop_footer: bool,
+    pub inject: Option<InjectFile>,
+}
+
+/// One file pushed into the recovery payload cpio before the rebuild
+/// (`--inject-lgz PATH [--inject-name NAME]`): the per-device touch
+/// archive `<device>.lgz` at the payload root. The rebuilt recovery
+/// fragment carries it, so partition free-size accounting covers it
+/// with everything else. Same-name entries already in the payload are
+/// dropped first (re-injecting over an old install never duplicates).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectFile {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+/// Normalize a cpio path for comparison (leading `./` ignored).
+fn norm_cpio_name(n: &str) -> &str {
+    n.strip_prefix("./").unwrap_or(n)
+}
+
+/// Drop same-named entries, then push the injected file. Entries are
+/// expected trailer-free (callers pass post-`drop_trailers` lists).
+fn inject_into_entries(mut entries: Vec<Entry>, inject: &Option<InjectFile>) -> Vec<Entry> {
+    let Some(inj) = inject else { return entries };
+    entries.retain(|e| norm_cpio_name(&cpio::name_str(e)) != inj.name);
+    entries.push(cpio::make_entry(&inj.name, &inj.data));
+    note!("inject: {} ({} bytes) pushed into payload", inj.name, inj.data.len());
+    entries
 }
 
 /// Parsed `--drop` list.
@@ -1178,6 +1206,7 @@ fn build_recovery(
     orig_valid_dlkm: Option<(RamdiskEntry, Vec<u8>)>,
     label: &str,
     data: &[u8],
+    inject: &Option<InjectFile>,
 ) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
     // Entry pool: per-fragment when the kept set is usable, whole-blob
     // rescue otherwise (stale-table base). attributed with its fragment
@@ -1243,15 +1272,19 @@ fn build_recovery(
     if n > 0 {
         note!("dropped {n} first-stage duplicates from {label} (inbuild first-stage wins)");
     }
-    let fox_rec = cpio::drop_trailers(&fox_stripped);
+    let fox_rec = inject_into_entries(cpio::drop_trailers(&fox_stripped), inject);
     if fox_rec.is_empty() {
         return Err(Error::Parse(format!(
             "refusing recovery install: {label} yields no recovery payload"
         )));
     }
-    // Verbatim bytes when nothing was stripped, re-encoded otherwise.
-    let fox_bytes =
-        if n == 0 { fox_raw } else { lz4legacy::compress_legacy(&cpio::build(&fox_rec)) };
+    // Verbatim bytes when nothing was stripped and nothing injected,
+    // re-encoded otherwise.
+    let fox_bytes = if n == 0 && inject.is_none() {
+        fox_raw
+    } else {
+        lz4legacy::compress_legacy(&cpio::build(&fox_rec))
+    };
     // board_id: first original recovery entry's, else the platform's.
     let rec_bid = im
         .table
@@ -1355,6 +1388,7 @@ fn build_platform_recovery(
     variant: RecoveryInPlatform,
     label: &str,
     data: &[u8],
+    inject: &Option<InjectFile>,
 ) -> Result<(Vec<Vec<u8>>, Vec<RamdiskEntry>)> {
     // Entry pool: same sourcing as build_recovery (per-fragment when the
     // kept set is usable, whole-blob rescue on a stale table).
@@ -1399,7 +1433,8 @@ fn build_platform_recovery(
             }
             let mut plat = fs_entries.clone();
             plat.extend(cpio::drop_trailers(&stripped));
-            let raw = lz4legacy::compress_legacy(&cpio::build(&cpio::drop_trailers(&plat)));
+            let plat = inject_into_entries(cpio::drop_trailers(&plat), inject);
+            let raw = lz4legacy::compress_legacy(&cpio::build(&plat));
             let entries = blob_entries(&raw)
                 .map_err(|e| Error::Parse(format!("internal error re-reading var1 platform: {e}")))?;
             (raw, entries)
@@ -1410,10 +1445,24 @@ fn build_platform_recovery(
                     "refusing recovery-is-platform var2: payload carries no first_stage_ramdisk/** (build a var2-AIO payload with build.sh --platform-recovery)".to_string(),
                 ));
             }
-            // Payload as-is (verbatim bytes when already compressed).
-            let entries = blob_entries(&fox_raw)
-                .map_err(|e| Error::Parse(format!("internal error re-reading var2 platform: {e}")))?;
-            (fox_raw, entries)
+            // Payload as-is (verbatim bytes when already compressed and
+            // nothing injected); re-encoded when the inject lands.
+            if inject.is_none() {
+                let entries = blob_entries(&fox_raw)
+                    .map_err(|e| Error::Parse(format!("internal error re-reading var2 platform: {e}")))?;
+                (fox_raw, entries)
+            } else {
+                let plat = inject_into_entries(
+                    cpio::drop_trailers(&blob_entries(&fox_raw).map_err(|e| {
+                        Error::Parse(format!("internal error re-reading var2 platform: {e}"))
+                    })?),
+                    inject,
+                );
+                let raw = lz4legacy::compress_legacy(&cpio::build(&plat));
+                let entries = blob_entries(&raw)
+                    .map_err(|e| Error::Parse(format!("internal error re-reading var2 platform: {e}")))?;
+                (raw, entries)
+            }
         }
     };
     let _ = drops;
@@ -1514,7 +1563,7 @@ pub fn repack(orig_bytes: &[u8], platform: Option<(&str, Vec<u8>)>, mode: Mode) 
     repack_with_opts(
         orig_bytes,
         platform,
-        RepackOpts { mode, drop: Vec::new(), sets: Vec::new(), recovery: None, recovery_is_platform: None, drop_footer: false },
+        RepackOpts { mode, drop: Vec::new(), sets: Vec::new(), recovery: None, recovery_is_platform: None, drop_footer: false, inject: None },
     )
 }
 
@@ -1625,7 +1674,7 @@ pub fn repack_with_opts(
         let (label, data) = opts.recovery.as_ref().ok_or_else(|| {
             Error::Usage("--recovery-is-platform needs a payload (--recovery <file>)".to_string())
         })?;
-        build_platform_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, variant, label, data)?
+        build_platform_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, variant, label, data, &opts.inject)?
     } else if let Some((label, data)) = &opts.recovery {
         if platform.is_some() {
             return Err(Error::Usage(
@@ -1637,7 +1686,7 @@ pub fn repack_with_opts(
                 "--recovery conflicts with --split-first-stage/--merge".to_string(),
             ));
         }
-        build_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, label, data)?
+        build_recovery(&im, &kept, &drops, &orig, orig_valid_dlkm, label, data, &opts.inject)?
     } else {
         match (platform, mode) {
         (None, Mode::Keep) => {
@@ -1788,4 +1837,196 @@ pub fn repack_with_opts(
     );
     verify_image(&out).map_err(|e| Error::Verify(format!("refusing to emit invalid image: {e}")))?;
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::vendor::Header;
+
+    fn newc_entry(name: &[u8], data: &[u8]) -> Vec<u8> {
+        // newc: magic + 13 u32-hex fields, name+NUL, pad4, data, pad4.
+        let mut h = b"070701".to_vec();
+        let fields = [
+            1u32,          // ino
+            0o100644,      // mode
+            0,             // uid
+            0,             // gid
+            1,             // nlink
+            0,             // mtime
+            data.len() as u32,
+            0, 0, 0, 0,    // devmajor/minor, rdevmajor/minor
+            name.len() as u32 + 1,
+            0,             // check
+        ];
+        for f in fields {
+            h.extend_from_slice(format!("{f:08x}").as_bytes());
+        }
+        let mut out = h;
+        out.extend_from_slice(name);
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    fn newc_cpio(files: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (n, d) in files {
+            out.extend_from_slice(&newc_entry(n, d));
+        }
+        out.extend_from_slice(&newc_entry(b"TRAILER!!!", b""));
+        out
+    }
+
+    fn rec_entry(name: &str, size: u32, offset: u32) -> RamdiskEntry {
+        let mut n = [0u8; 32];
+        n[..name.len()].copy_from_slice(name.as_bytes());
+        RamdiskEntry { size, offset, entry_type: TYPE_RECOVERY, name: n, board_id: [0u8; 64] }
+    }
+
+    /// Minimal valid vendor_boot v4: platform (first_stage) + recovery.
+    fn test_image() -> Vec<u8> {
+        let plat = lz4legacy::compress_legacy(&newc_cpio(&[
+            (b"first_stage_ramdisk/a", b"a"),
+            (b"first_stage_ramdisk/system/bin/x", b"x"),
+        ]));
+        let rec = lz4legacy::compress_legacy(&newc_cpio(&[(b"system/bin/tool", b"t")]));
+        let e0 = RamdiskEntry::platform(plat.len() as u32);
+        let e1 = rec_entry("recovery", rec.len() as u32, plat.len() as u32);
+        let hdr = Header {
+            header_version: 4,
+            page_size: 4096,
+            kernel_addr: 0,
+            ramdisk_addr: 0,
+            ramdisk_size: (plat.len() + rec.len()) as u32,
+            cmdline: [0u8; 2048],
+            tags_addr: 0,
+            name: [0u8; 16],
+            header_size: 2128,
+            dtb_size: 0,
+            dtb_addr: 0,
+            table_size: 216,
+            table_entry_num: 2,
+            table_entry_size: 108,
+            bootconfig_size: 0,
+        };
+        assemble(&hdr, &[plat, rec], &[e0, e1], &[], &[], &[])
+    }
+
+    fn table_of(img: &[u8]) -> Vec<(u32, String, u32)> {
+        Image::load(img)
+            .unwrap()
+            .table
+            .iter()
+            .map(|e| (e.entry_type, e.name_str(), e.size))
+            .collect()
+    }
+
+    fn repack_inject(img: &[u8], inject: Option<InjectFile>) -> Vec<u8> {
+        let payload = lz4legacy::compress_legacy(&newc_cpio(&[(b"system/bin/newtool", b"n")]));
+        repack_with_opts(
+            img,
+            None,
+            RepackOpts {
+                mode: Mode::Keep,
+                drop: Vec::new(),
+                sets: Vec::new(),
+                recovery: Some(("payload".to_string(), payload)),
+                recovery_is_platform: None,
+                drop_footer: true,
+                inject,
+            },
+        )
+        .expect("repack must succeed")
+    }
+
+    /// Decompressed recovery-fragment entry names, in order.
+    fn recovery_names(img: &[u8]) -> Vec<String> {
+        let im = Image::load(img).unwrap();
+        let (_, rec) = im
+            .table
+            .iter()
+            .enumerate()
+            .find(|(_, e)| e.entry_type == TYPE_RECOVERY)
+            .expect("recovery fragment must exist");
+        let idx = im.table.iter().position(|e| e.size == rec.size && e.offset == rec.offset).unwrap();
+        let dec = lz4legacy::decompress_legacy(&im.frag_bytes(idx).unwrap()).unwrap();
+        cpio::parse(&dec).unwrap().iter().map(|e| cpio::name_str(e)).collect()
+    }
+
+    #[test]
+    fn inject_lgz_lands_in_recovery() {
+        let img = test_image();
+        let out = repack_inject(
+            &img,
+            Some(InjectFile { name: "shiba.lgz".to_string(), data: b"LGZDATA".to_vec() }),
+        );
+        // Still exactly platform + recovery: no new fragment.
+        let t = table_of(&out);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[1].0, TYPE_RECOVERY);
+        let names = recovery_names(&out);
+        assert!(names.contains(&"shiba.lgz".to_string()), "injected file missing: {names:?}");
+        assert!(names.contains(&"system/bin/newtool".to_string()));
+    }
+
+    #[test]
+    fn inject_replaces_same_name() {
+        let img = test_image();
+        // First install plants the lgz...
+        let once = repack_inject(
+            &img,
+            Some(InjectFile { name: "shiba.lgz".to_string(), data: b"OLD".to_vec() }),
+        );
+        assert_eq!(recovery_names(&once).iter().filter(|n| *n == "shiba.lgz").count(), 1);
+        // ...reflash over it replaces, never duplicates.
+        let twice = repack_inject(
+            &once,
+            Some(InjectFile { name: "shiba.lgz".to_string(), data: b"NEW".to_vec() }),
+        );
+        let names = recovery_names(&twice);
+        assert_eq!(names.iter().filter(|n| *n == "shiba.lgz").count(), 1);
+        let im = Image::load(&twice).unwrap();
+        let idx = im.table.iter().position(|e| e.entry_type == TYPE_RECOVERY).unwrap();
+        let dec = lz4legacy::decompress_legacy(&im.frag_bytes(idx).unwrap()).unwrap();
+        assert!(dec.windows(3).any(|w| w == b"NEW"));
+        assert!(!dec.windows(3).any(|w| w == b"OLD"));
+    }
+
+    #[test]
+    fn inject_none_is_plain_rebuild() {
+        let img = test_image();
+        let out = repack_inject(&img, None);
+        let names = recovery_names(&out);
+        assert!(!names.iter().any(|n| n.ends_with(".lgz")));
+        assert!(names.contains(&"system/bin/newtool".to_string()));
+    }
+
+    #[test]
+    fn inject_into_entries_unit() {
+        let base = cpio::parse(&newc_cpio(&[(b"a", b"1"), (b"shiba.lgz", b"OLD")])).unwrap();
+        let base = cpio::drop_trailers(&base);
+        // No inject: untouched.
+        assert_eq!(inject_into_entries(base.clone(), &None).len(), 2);
+        // Inject: same name replaced, others kept.
+        let out = inject_into_entries(
+            base,
+            &Some(InjectFile { name: "shiba.lgz".to_string(), data: b"NEW".to_vec() }),
+        );
+        assert_eq!(out.len(), 2);
+        let names: Vec<String> = out.iter().map(|e| cpio::name_str(e)).collect();
+        assert!(names.contains(&"a".to_string()));
+        assert_eq!(names.iter().filter(|n| *n == "shiba.lgz").count(), 1);
+        // make_entry round-trips through parse (NUL-terminated name).
+        let dec = cpio::build(&out);
+        let back: Vec<String> =
+            cpio::parse(&dec).unwrap().iter().map(|e| cpio::name_str(e)).collect();
+        assert!(back.contains(&"shiba.lgz".to_string()));
+    }
 }

@@ -158,6 +158,21 @@ pub fn has_payload(entries: &[Entry]) -> bool {
     entries.iter().any(|e| !is_dir(e))
 }
 
+/// Build a newc entry for raw bytes (regular file, 0644, root:root).
+/// The stored name carries the NUL terminator, exactly like parsed
+/// entries, so [`build`] round-trips it byte-identically.
+pub fn make_entry(name: &str, data: &[u8]) -> Entry {
+    let h = format!(
+        "070701{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        1, 0o100644, 0, 0, 1, 0, data.len(), 0, 0, 0, 0, name.len() + 1, 0
+    );
+    let mut header = [0u8; HDR_LEN];
+    header.copy_from_slice(&h.as_bytes()[..HDR_LEN]);
+    let mut stored = name.as_bytes().to_vec();
+    stored.push(0);
+    Entry { header, name: stored, data: data.to_vec() }
+}
+
 /// Serialize entries as one archive with a single TRAILER.
 pub fn build(entries: &[Entry]) -> Vec<u8> {
     let mut out = Vec::new();

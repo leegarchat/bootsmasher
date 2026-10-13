@@ -301,6 +301,7 @@ fn run_inner(args: &[String]) -> Result<()> {
                 recovery: rec_data,
                 recovery_is_platform: cli.recovery_is_platform,
                 drop_footer: cli.drop_footer,
+                inject: None,
             },
         )?;
         if let Some(pad) = cli.pad_to {
@@ -343,9 +344,10 @@ fn run_inner(args: &[String]) -> Result<()> {
             mode: cli.mode,
             drop: cli.drop.clone(),
             sets: cli.sets.clone(),
-            recovery: rec_ref,
-            recovery_is_platform: cli.recovery_is_platform,
-            drop_footer: cli.drop_footer,
+                recovery: rec_ref,
+                recovery_is_platform: cli.recovery_is_platform,
+                drop_footer: cli.drop_footer,
+                inject: None,
         },
     )?;
 

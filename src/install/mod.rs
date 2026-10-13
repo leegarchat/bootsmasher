@@ -12,6 +12,7 @@
 //! 0 ok (or clean abort), 1 usage / no device, 2 build/verify/flash.
 
 pub(crate) mod help;
+pub(crate) mod devices;
 mod fb;
 
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::common::codec;
 use crate::common::cpio;
 use crate::common::vendor::type_name;
-use crate::vboot::ops::{self, Mode, RecoveryInPlatform, RepackOpts};
+use crate::vboot::ops::{self, InjectFile, Mode, RecoveryInPlatform, RepackOpts};
 use console::style;
 
 use fb::Tools;
@@ -47,6 +48,11 @@ struct Cli {
     recovery_is_platform: String,
     transport: String,
     demo: bool,
+    device: String,
+    inject_lgz: String,
+    inject_name: String,
+    partition_size: String,
+    min_free_mb: String,
 }
 
 /// Maps a `--recovery-is-platform` value to the ops variant.
@@ -69,7 +75,7 @@ fn layout_name(v: &str) -> &'static str {
 }
 
 fn parse_cli(args: &[String]) -> Result<Cli, String> {
-    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), recovery_img: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new(), log: String::new(), recovery_is_platform: String::new(), transport: String::new(), demo: false };
+    let mut c = Cli { force: false, slot: String::new(), mode: String::new(), backup: String::new(), export: String::new(), recovery_img: String::new(), file: false, input: String::new(), cpio: String::new(), output: String::new(), log: String::new(), recovery_is_platform: String::new(), transport: String::new(), demo: false, device: String::new(), inject_lgz: String::new(), inject_name: String::new(), partition_size: String::new(), min_free_mb: String::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -139,6 +145,31 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
                 c.transport = args.get(i).ok_or("--transport needs fastboot|adb".to_string())?.clone();
             }
             s if s.starts_with("--transport=") => c.transport = s["--transport=".len()..].to_string(),
+            "--device" => {
+                i += 1;
+                c.device = args.get(i).ok_or("--device needs a codename (e.g. shiba)".to_string())?.clone();
+            }
+            s if s.starts_with("--device=") => c.device = s["--device=".len()..].to_string(),
+            "--inject-lgz" => {
+                i += 1;
+                c.inject_lgz = args.get(i).ok_or("--inject-lgz needs a <device>.lgz file".to_string())?.clone();
+            }
+            s if s.starts_with("--inject-lgz=") => c.inject_lgz = s["--inject-lgz=".len()..].to_string(),
+            "--inject-name" => {
+                i += 1;
+                c.inject_name = args.get(i).ok_or("--inject-name needs a payload name".to_string())?.clone();
+            }
+            s if s.starts_with("--inject-name=") => c.inject_name = s["--inject-name=".len()..].to_string(),
+            "--partition-size" => {
+                i += 1;
+                c.partition_size = args.get(i).ok_or("--partition-size needs bytes".to_string())?.clone();
+            }
+            s if s.starts_with("--partition-size=") => c.partition_size = s["--partition-size=".len()..].to_string(),
+            "--min-free-mb" => {
+                i += 1;
+                c.min_free_mb = args.get(i).ok_or("--min-free-mb needs MiB".to_string())?.clone();
+            }
+            s if s.starts_with("--min-free-mb=") => c.min_free_mb = s["--min-free-mb=".len()..].to_string(),
             other => return Err(format!("unknown arg: {other}")),
         }
         i += 1;
@@ -147,7 +178,9 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         if c.force || c.file || !c.slot.is_empty() || !c.mode.is_empty() || !c.backup.is_empty()
             || !c.export.is_empty() || !c.recovery_img.is_empty() || !c.input.is_empty() || !c.cpio.is_empty()
             || !c.output.is_empty() || !c.log.is_empty() || !c.recovery_is_platform.is_empty()
-            || !c.transport.is_empty()
+            || !c.transport.is_empty() || !c.device.is_empty() || !c.inject_lgz.is_empty()
+            || !c.inject_name.is_empty()
+            || !c.partition_size.is_empty() || !c.min_free_mb.is_empty()
         {
             return Err("--demo takes no other flags".to_string());
         }
@@ -160,12 +193,31 @@ fn parse_cli(args: &[String]) -> Result<Cli, String> {
         if c.input.is_empty() || c.cpio.is_empty() || c.output.is_empty() {
             return Err("--file needs -i INPUT -c CPIOPAYLOAD -o OUTPUT".to_string());
         }
-        // Validate the layout value early (the only extra flag --file takes).
+        // Validate the layout value early (a --file extra flag).
         layout_variant(&c.recovery_is_platform)?;
+        // Device pool check first: an unknown codename fails immediately.
+        if !c.device.is_empty() && devices::family_of(&c.device).is_none() {
+            return Err(format!("unknown device '{}' (outside the Pixel pool)", c.device));
+        }
+        if !c.inject_name.is_empty() && c.inject_lgz.is_empty() {
+            return Err("--inject-name needs --inject-lgz".to_string());
+        }
+        // NOTE: --inject-lgz without --inject-name is fine (basename default).
+        if !c.partition_size.is_empty() && c.partition_size.parse::<u64>().is_err() {
+            return Err("--partition-size needs bytes (integer)".to_string());
+        }
+        if !c.min_free_mb.is_empty() && c.min_free_mb.parse::<u64>().is_err() {
+            return Err("--min-free-mb needs MiB (integer)".to_string());
+        }
         return Ok(c);
     }
     if !c.log.is_empty() {
         return Err("--log needs --file".to_string());
+    }
+    for (flag, val) in [("--device", &c.device), ("--inject-lgz", &c.inject_lgz), ("--inject-name", &c.inject_name), ("--partition-size", &c.partition_size), ("--min-free-mb", &c.min_free_mb)] {
+        if !val.is_empty() {
+            return Err(format!("{flag} needs --file"));
+        }
     }
     if !c.input.is_empty() || !c.cpio.is_empty() || !c.output.is_empty() {
         return Err("-i/-c/-o need --file".to_string());
@@ -205,6 +257,9 @@ struct Config {
     /// (export.txt MIN_FREE_MB, default 7).
     min_free: u64,
     min_free_mb: u64,
+    /// Per-device touch archives (<device>.lgz), relative to the export
+    /// file's directory (export.txt MODULES_DIR, default "modules").
+    modules_dir: PathBuf,
 }
 
 fn strip_quotes(v: &str) -> &str {
@@ -315,7 +370,8 @@ fn resolve_config(export_path: &Path, recovery_override: &str) -> Result<Config,
         None => 7,
         Some(v) => v.parse().map_err(|_| format!("bad MIN_FREE_MB in export.txt: '{v}' (want MiB integer)"))?,
     };
-    Ok(Config { recovery_img, backup_dir, log_dir, tools: Tools { fastboot, adb }, tools_line, min_free: min_free_mb * 1024 * 1024, min_free_mb })
+    let modules_dir = rel(&get("MODULES_DIR", "modules"));
+    Ok(Config { recovery_img, backup_dir, log_dir, tools: Tools { fastboot, adb }, tools_line, min_free: min_free_mb * 1024 * 1024, min_free_mb, modules_dir })
 }
 
 /// Can this tool binary actually run here? Spawns `<bin> --version`
@@ -1153,6 +1209,48 @@ fn endpoint_label(ctx: &mut Ctx, ep: &Endpoint) -> String {
     }
 }
 
+/// Hardware codename for the picked transport (fastboot getvar product,
+/// else adb ro.product.device). "?" when unreadable — callers treat it
+/// as "no touch archive", never fatal (it is a hardware readout, not a
+/// user claim like --device).
+fn product_codename(ctx: &mut Ctx) -> String {
+    match ctx.transport {
+        Transport::Fastboot => fb::getvar(&ctx.cfg.tools.fastboot, &ctx.serial, "product", &mut ctx.log)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| "?".to_string()),
+        Transport::Adb { .. } => fb::adb_prop(&ctx.cfg.tools.adb, &ctx.serial, "ro.product.device", &mut ctx.log)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|| "?".to_string()),
+    }
+}
+
+/// Auto touch archive for the device flow: modules/<product>.lgz next
+/// to export.txt is pushed into the recovery payload (same --inject-lgz
+/// mechanics as --file). Unknown product or missing file = loud note,
+/// install proceeds without the archive (stock touch path covers it).
+fn auto_inject(ctx: &mut Ctx) -> Option<ops::InjectFile> {
+    let product = product_codename(ctx);
+    match devices::family_of(product.as_str()) {
+        Some(fam) => {
+            let path = ctx.cfg.modules_dir.join(format!("{product}.lgz"));
+            match std::fs::read(&path) {
+                Ok(data) => {
+                    ctx.say(&format!("  • touch archive: {product}.lgz (family {fam}, {} into payload)", mb(data.len() as u64)));
+                    Some(ops::InjectFile { name: format!("{product}.lgz"), data })
+                }
+                Err(_) => {
+                    ctx.say(&format!("  • no touch archive for {product} ({} missing), installing without it", path.display()));
+                    None
+                }
+            }
+        }
+        None => {
+            ctx.say(&format!("  • product '{product}' outside the Pixel pool, installing without touch archive"));
+            None
+        }
+    }
+}
+
 /// Product + active slot line for the picked transport, then the log
 /// path. Fastboot reads getvar; adb reads getprop (slot suffix `_a`
 /// becomes `a`).
@@ -1554,6 +1652,7 @@ fn stage_prepare(ctx: &mut Ctx) -> bool {
             }
         };
         let _quiet = QuietGuard::on();
+        let inject = auto_inject(ctx);
         for s in ctx.slots.clone() {
             let stock = match std::fs::read(ctx.backup.join(format!("vendor_boot_{s}.img"))) {
                 Ok(b) => b,
@@ -1570,7 +1669,7 @@ fn stage_prepare(ctx: &mut Ctx) -> bool {
                 }
             };
             // Layout was announced once above (same for every slot).
-            let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((fox_name.clone(), fox.clone())), recovery_is_platform: rip, drop_footer: true };
+            let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((fox_name.clone(), fox.clone())), recovery_is_platform: rip, drop_footer: true, inject: inject.clone() };
             match ops::repack_with_opts(&stock, None, opts) {
                 Ok(out) => {
                     let dst = ctx.work.join(format!("flash_{s}.img"));
@@ -1958,7 +2057,42 @@ fn run_file(cli: &Cli) -> i32 {
         Some(RecoveryInPlatform::Var1) => say!("  rebuild ({label}, footer dropped, Type B var1: all-in-platform)"),
         Some(RecoveryInPlatform::Var2) => say!("  rebuild ({label}, footer dropped, Type C var2: payload-only platform)"),
     }
-    let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((label, payload)), recovery_is_platform: rip, drop_footer: true };
+    if !cli.device.is_empty() {
+        // Pool already validated in parse_cli; family lookup cannot miss.
+        let fam = devices::family_of(&cli.device).unwrap_or("?");
+        say!("  device: {} (family {}, remembered in this log)", cli.device, fam);
+    }
+    let inject: Option<InjectFile> = if !cli.inject_lgz.is_empty() {
+        // Payload name defaults to the file's own basename (<device>.lgz).
+        let name = if cli.inject_name.is_empty() {
+            match std::path::Path::new(&cli.inject_lgz).file_name().and_then(|n| n.to_str()) {
+                Some(b) if !b.is_empty() => {
+                    say!("  inject: name defaults to {b} (basename)");
+                    b.to_string()
+                }
+                _ => {
+                    say!("  FAIL: --inject-lgz needs --inject-name (basename unusable)");
+                    return 2;
+                }
+            }
+        } else {
+            cli.inject_name.clone()
+        };
+        match std::fs::read(&cli.inject_lgz) {
+            Ok(data) => Some(InjectFile { name, data }),
+            Err(e) => {
+                say!("  FAIL: cannot read inject lgz: {e}");
+                return 2;
+            }
+        }
+    } else {
+        if !cli.inject_name.is_empty() {
+            say!("  FAIL: --inject-name needs --inject-lgz");
+            return 2;
+        }
+        None
+    };
+    let opts = RepackOpts { mode: Mode::Keep, drop: Vec::new(), sets: Vec::new(), recovery: Some((label, payload)), recovery_is_platform: rip, drop_footer: true, inject };
     let _quiet = QuietGuard::on();
     let out = match ops::repack_with_opts(&img, None, opts) {
         Ok(o) => o,
@@ -1974,6 +2108,27 @@ fn run_file(cli: &Cli) -> i32 {
             say!("  FAIL: rebuilt image INVALID, nothing written");
             return 2;
         }
+    }
+    // Free-size accounting WITH the extra section (it is already inside
+    // `out`): enforced before anything is written, so a failure means
+    // "nothing written". Without --partition-size only the size is logged.
+    if !cli.partition_size.is_empty() {
+        let psz: u64 = cli.partition_size.parse().unwrap_or(0);
+        let min_mb: u64 = if cli.min_free_mb.is_empty() { 7 } else { cli.min_free_mb.parse().unwrap_or(7) };
+        let min_free = min_mb.saturating_mul(1048576);
+        let out_len = out.len() as u64;
+        say!("  size: image {} / partition {}, free {} (policy {} MB free)",
+            mb(out_len), mb(psz), mb(psz.saturating_sub(out_len)), min_mb);
+        if out_len > psz {
+            say!("  FAIL: image DOES NOT FIT partition, nothing written");
+            return 2;
+        }
+        if psz - out_len < min_free {
+            say!("  FAIL: less than {min_mb} MB free left, nothing written");
+            return 2;
+        }
+    } else {
+        say!("  size: image {} (no --partition-size, fit check skipped)", mb(out.len() as u64));
     }
     match std::fs::write(&cli.output, &out) {
         Ok(()) => say!("  ok: wrote {} ({})", cli.output, mb(out.len() as u64)),
@@ -2477,5 +2632,81 @@ pub fn run(args: &[String], prog: &str) -> i32 {
     } else {
         ctx.say(&format!("{}", style(format!("RESULT: FAIL (pass={} fail={}; see {})", ctx.pass, ctx.fail, short_path(&ctx.log_path))).red().bold()));
         2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(args: &[&str]) -> Result<Cli, String> {
+        parse_cli(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+    // NOTE: parse_cli sees args WITHOUT the leading "install" (main.rs strips it).
+
+    #[test]
+    fn file_flags_validate() {
+        // Unknown device fails immediately.
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c", "--device", "notapixel"]).is_err());
+        // Known device passes.
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c", "--device", "shiba"]).is_ok());
+        // Inject lgz alone is fine (name defaults to basename).
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c",
+                      "--inject-lgz", "modules/shiba.lgz"]).is_ok());
+        // Explicit name also fine.
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c",
+                      "--inject-lgz", "f", "--inject-name", "shiba.lgz"]).is_ok());
+        // Name without file is rejected.
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c",
+                      "--inject-name", "shiba.lgz"]).is_err());
+        // Sizes validated.
+        assert!(cli(&["--file", "-i", "a", "-c", "b", "-o", "c",
+                      "--partition-size", "abc"]).is_err());
+        // New flags rejected outside --file.
+        assert!(cli(&["install", "--device", "shiba"]).is_err());
+        assert!(cli(&["install", "--inject-lgz", "f"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn write_exe(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn scaffold(modules_line: Option<&str>) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "fox_cfg_{}_{}",
+            std::process::id(),
+            modules_line.is_some() as u8
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("pt")).unwrap();
+        write_exe(&root.join("pt").join("fastboot"));
+        write_exe(&root.join("pt").join("adb"));
+        std::fs::write(root.join("payload.lz4"), b"payload").unwrap();
+        let mut exp = "RECOVERY_IMG=payload.lz4\nPLATFORM_TOOLS_LINUX=pt\nPLATFORM_TOOLS_WINDOWS=pt\nFASTBOOT_BIN=fastboot\nADB_BIN=adb\n".to_string();
+        if let Some(l) = modules_line {
+            exp.push_str(l);
+            exp.push('\n');
+        }
+        std::fs::write(root.join("export.txt"), exp).unwrap();
+        root
+    }
+
+    #[test]
+    fn modules_dir_defaults_and_overrides() {
+        let r1 = scaffold(None);
+        let c1 = resolve_config(&r1.join("export.txt"), "").expect("default config");
+        assert_eq!(c1.modules_dir, r1.join("modules"));
+        let r2 = scaffold(Some("MODULES_DIR=custom_mods"));
+        let c2 = resolve_config(&r2.join("export.txt"), "").expect("custom config");
+        assert_eq!(c2.modules_dir, r2.join("custom_mods"));
+        let _ = std::fs::remove_dir_all(&r1);
+        let _ = std::fs::remove_dir_all(&r2);
     }
 }

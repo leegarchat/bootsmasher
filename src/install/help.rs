@@ -52,7 +52,9 @@ Usage:
   {prog} install --demo   (UI preview: canned device, same menus and
                  screens, no fastboot/adb, nothing read or flashed)
   {prog} install --file -i INPUT -c CPIOPAYLOAD -o OUTPUT [--log FILE]
-                 [--recovery-is-platform var1|var2]
+                 [--recovery-is-platform var1|var2] [--device CODENAME]
+                 [--inject-lgz FILE [--inject-name NAME]]
+                 [--partition-size BYTES] [--min-free-mb N]
                  (recovery install into a plain image file: verify input,
                  rebuild with the payload, verify output, write; no
                  device, no backup, no menus; built for recovery use)
@@ -73,6 +75,10 @@ pub fn expand(prog: &str) -> String {
 
 export.txt keys (all optional, built-ins shown):
   RECOVERY_IMG=OrangeFox-R12.0-test5-aio.ramdisk.lz4
+  MODULES_DIR=modules      (per-device touch archives <device>.lgz: the
+                           matching one is pushed into the recovery
+                           payload automatically; missing = install
+                           without the archive)
   BACKUP_DIR=backup        (stock image backups: backup/<name>/)
   LOG_DIR=logs             (per-run logs: logs/<datetime>/install.log;
                            the desktop launchers find the run log there
@@ -143,6 +149,25 @@ footer dropped, same recovery-install layout as the device flow),
 the result is verified again and only then written. Input and output
 must not be the same file. Short status lines go to stdout, verdict
 details to stderr; --log FILE additionally tees both into the file.
+
+File-mode extras (touch archive):
+  --device CODENAME        validated against the Pixel pool immediately;
+                           unknown codenames fail, the match is logged
+                           (family) as the remembered device.
+  --inject-lgz FILE [--inject-name NAME] pushes FILE into the recovery
+                           payload cpio before the rebuild (the per-device
+                           touch archive <device>.lgz at the payload root;
+                           NAME defaults to the file basename). Same-name
+                           payload entries are replaced, never duplicated,
+                           so re-injecting over an old install is safe.
+                           The archive rides inside the recovery fragment,
+                           so partition free-size accounting covers it.
+  --partition-size BYTES [--min-free-mb N, default 7] enforces the
+                           free-space policy on the rebuilt image WITH
+                           the injected file included, before anything
+                           is written (fit failure and below-policy
+                           both fail; without --partition-size only
+                           the size is logged).
 
 Install layouts (questionnaire Type A/B/C, --recovery-is-platform):
   Type A (default): classic — payload becomes the recovery fragment,
